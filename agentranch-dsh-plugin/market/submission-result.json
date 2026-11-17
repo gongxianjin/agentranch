@@ -1,6 +1,13 @@
 {
-  "status": "NOT_PUBLISHED",
+  "status": "PUSHED_REPO_PENDING_NPM",
   "published": false,
+  "repoPush": {
+    "date": "2026-11-17",
+    "remote": "https://github.com/gongxianjin/agentranch.git",
+    "branch": "v0.2-win",
+    "range": "4ec3aa9..3295538",
+    "remoteRefVerified": "refs/heads/v0.2-win = 32955381d1245c2fc0db95e8640f0edb7af4b2d6 (git ls-remote, independent of push output)"
+  },
   "runtimeSmokeTest": "PASS",
   "runtimeSmokeEvidence": {
     "date": "2026-11-17",
@@ -14,12 +21,12 @@
   },
   "releaseArtifact": {
     "tarball": "release/agentranch-dsh-0.1.0.tgz",
-    "bytes": 11861,
-    "sha256": "40dc6ca158019364f59b358ba2da8f061bc34c55e788c1050a17c1efa57c62e9"
+    "bytes": 11882,
+    "sha256": "1fbdbc76177619702e390e41ffd83d9d5ceee02baac5d5871358bbfa784571d7",
+    "note": "Repacked 2026-11-17 from merged tree 3295538 after release/ was found deleted; 22 files. Earlier VERIFICATION.md recorded 11861/40dc6c... from the pre-merge worktree build — differs because tar timestamps/compression are not byte-stable across pack runs; content source tree identical (commit 3295538)."
   },
   "blockers": [
-    "No authenticated npm account is available in this environment.",
-    "No authorized external repository push or creation was performed."
+    "No authenticated npm account is available in this environment (npm whoami → ENEEDAUTH). npm publish requires the user to run npm login and authorize publication."
   ],
   "nextVerification": "After explicit user authorization: create/push the public GitHub repository, publish agentranch-dsh@0.1.0 to npm, wait for the DSH Bazaar daily scan, then verify discovery and a clean-profile install from the public source."
 }
