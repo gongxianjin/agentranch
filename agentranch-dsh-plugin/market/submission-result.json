@@ -1,16 +1,31 @@
 {
-  "status": "PUBLISHED_GIT_PENDING_MARKET_SCAN",
+  "status": "PUBLISHED_GIT_VERIFIED",
   "published": true,
   "publication": {
     "channel": "github-public-repo",
     "date": "2026-11-17",
     "repo": "https://github.com/gongxianjin/agentranch-dsh",
     "branch": "main",
-    "commit": "18b221a",
+    "commit": "94ba5a3",
+    "history": ["18b221a initial publish (no dist)", "94ba5a3 fix: commit dist/ so git-channel installs load"],
     "topics": ["agentranch", "dsh-plugin", "deepseek-hardness"],
     "packageJsonAtRoot": true,
     "publicVisibilityVerified": "anonymous GET api.github.com/repos/gongxianjin/agentranch-dsh/topics returned 200 with names",
-    "npmPublish": "NOT_RUN — npm signup page blocked by Cloudflare IP challenge (183.179.107.193 flagged as bot-adjacent); Git channel chosen per user decision 2026-11-17. npm remains the preferred channel if credentials become available later."
+    "npmPublish": "NOT_RUN — npm signup page blocked by Cloudflare IP challenge; Git channel chosen per user decision 2026-11-17. npm remains the preferred channel if credentials become available later."
+  },
+  "endToEndVerification": {
+    "date": "2026-11-17",
+    "install": "dsh plugin --profile headless add git+https://github.com/gongxianjin/agentranch-dsh.git → 7 packages added",
+    "distPresent": "node_modules/agentranch-dsh/dist/index.js exists after install",
+    "activation": "live boot with plugin config: no activation warnings (contrast: pre-fix boot printed 'failed to import .../dist/index.js')",
+    "toolsRegistered": "persisted session.v4.jsonl.zstd contains agentranch_check, agentranch_identity, agentranch_local_check, agentranch_run_once",
+    "defectFoundAndFixed": "initial publish excluded dist/ → git installs failed to import; fixed by committing dist (94ba5a3); e2e re-verified after fix"
+  },
+  "marketDiscoveryReality": {
+    "search": "dsh plugin search queries npm registry only (pnpm search); GitHub repos are not searchable",
+    "discoverTab": "market bundle README: 'There is no official index; Discover lists only the index sources the user adds' — earlier 'wait for Bazaar daily scan' assumption was WRONG (no scanner exists)",
+    "installChannels": "dsh plugin add accepts npm names and git+https URLs (marketInstallTarget builds git+...#<commit>&path: constructs)",
+    "implication": "plugin is publicly installable via git URL now; search visibility requires npm publish when credentials allow"
   },
   "repoPush": {
     "date": "2026-11-17",
@@ -36,8 +51,6 @@
     "sha256": "1fbdbc76177619702e390e41ffd83d9d5ceee02baac5d5871358bbfa784571d7",
     "note": "Repacked 2026-11-17 from merged tree 3295538 after release/ was found deleted; 22 files. Earlier VERIFICATION.md recorded 11861/40dc6c... from the pre-merge worktree build — differs because tar timestamps/compression are not byte-stable across pack runs; content source tree identical (commit 3295538)."
   },
-  "blockers": [
-    "DSH Bazaar daily scan has not run against the new repository yet; market discovery cannot be verified until the scan observes topic dsh-plugin (unknown cadence, assumed daily)."
-  ],
-  "nextVerification": "Wait for the DSH Bazaar scan, then query the official market index/search for agentranch-dsh and perform a clean-profile dsh plugin add from the public GitHub source; record scan date and install result here."
+  "blockers": [],
+  "nextVerification": "When an npm account becomes available: npm publish agentranch-dsh@0.1.0, then dsh plugin search agentranch should return the entry (search indexes npm only)."
 }
