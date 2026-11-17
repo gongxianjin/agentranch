@@ -25,7 +25,23 @@
     "search": "dsh plugin search queries npm registry only (pnpm search); GitHub repos are not searchable",
     "discoverTab": "market bundle README: 'There is no official index; Discover lists only the index sources the user adds' — earlier 'wait for Bazaar daily scan' assumption was WRONG (no scanner exists)",
     "installChannels": "dsh plugin add accepts npm names and git+https URLs (marketInstallTarget builds git+...#<commit>&path: constructs)",
-    "implication": "plugin is publicly installable via git URL now; search visibility requires npm publish when credentials allow"
+    "implication": "plugin is publicly installable via git URL now; search visibility does NOT require npm — community index dshopen.org accepts pinned-commit git entries"
+  },
+  "communityIndexSubmission": {
+    "index": "dshopen.org/index.json (Open Plugin Market, format 1, 1266 plugins, 135 git-pinned entries)",
+    "backend": "github.com/polang233/dsh-plugin-index",
+    "channel": "issue #533 [plugin-add] agentranch-dsh, created 2026-11-17T08:10:52Z by gongxianjin, authorized by user ('提交')",
+    "url": "https://github.com/polang233/dsh-plugin-index/issues/533",
+    "state": "OPEN — awaiting maintainer review (security check + archive/hash verification of pinned commit 94ba5a3e8ab9dcdc076f4b01ac3ae5d7cb7eb344)",
+    "requirementsVerified": [
+      "public repo + pinned full 40-hex commit (git ls-remote)",
+      "dist/index.js + cordis.patch.yml + LICENSE present at pinned commit (raw.githubusercontent.com HTTP 200)",
+      "package.json: license MIT + repository field + dsh.bundle.patch + engines.dsh >=0.2.2-rc.1 <0.3.0",
+      "no webServer routes / no CORS surface / shell:false whitelist / allowedRoots+symlink checks (matches CONTRIBUTING.md review checklist)"
+    ],
+    "verificationOfIssue": "anonymous GET api.github.com/repos/polang233/dsh-plugin-index/issues/533 → 200, title/state/user/body markers all present",
+    "pendingAcceptance": "index.json entry 'agentranch-dsh' after maintainer approval + next ≤6h rebuild; check: curl -s https://dshopen.org/index.json | grep agentranch",
+    "note": "7-day reply rule: if maintainers request changes, reply in issue #533 within 7 days or it auto-closes (re-submission allowed)"
   },
   "repoPush": {
     "date": "2026-11-17",
@@ -52,5 +68,5 @@
     "note": "Repacked 2026-11-17 from merged tree 3295538 after release/ was found deleted; 22 files. Earlier VERIFICATION.md recorded 11861/40dc6c... from the pre-merge worktree build — differs because tar timestamps/compression are not byte-stable across pack runs; content source tree identical (commit 3295538)."
   },
   "blockers": [],
-  "nextVerification": "When an npm account becomes available: npm publish agentranch-dsh@0.1.0, then dsh plugin search agentranch should return the entry (search indexes npm only)."
+  "nextVerification": "Searchability: after maintainers approve issue #533 and the ≤6h rebuild lands, curl -s https://dshopen.org/index.json | grep agentranch must match; then any user who added the dshopen.org index source can find agentranch-dsh in DSH Discover. Secondary (optional): npm publish when an account becomes available — npm only gates `dsh plugin search`, not Discover search."
 }
