@@ -1,0 +1,25 @@
+{
+  "status": "NOT_PUBLISHED",
+  "published": false,
+  "runtimeSmokeTest": "PASS",
+  "runtimeSmokeEvidence": {
+    "date": "2026-11-17",
+    "dshVersion": "0.2.2-rc.1",
+    "nodeVersion": "v24.14.0",
+    "install": "clean profile via dsh plugin add release/agentranch-dsh-0.1.0.tgz — success",
+    "load": "boot reaches LLM stage; 27 tools advertised including agentranch_check, agentranch_identity, agentranch_local_check, agentranch_run_once",
+    "failureVisibility": "invalid awCliPath overlay produces 'dsh: warning: 1 entry did not activate' with ENOENT detail",
+    "uninstall": "profile manifest restored; post-uninstall boot clean",
+    "modelLoopToolCall": "NOT_RUN (no DEEPSEEK_API_KEY)"
+  },
+  "releaseArtifact": {
+    "tarball": "release/agentranch-dsh-0.1.0.tgz",
+    "bytes": 11861,
+    "sha256": "40dc6ca158019364f59b358ba2da8f061bc34c55e788c1050a17c1efa57c62e9"
+  },
+  "blockers": [
+    "No authenticated npm account is available in this environment.",
+    "No authorized external repository push or creation was performed."
+  ],
+  "nextVerification": "After explicit user authorization: create/push the public GitHub repository, publish agentranch-dsh@0.1.0 to npm, wait for the DSH Bazaar daily scan, then verify discovery and a clean-profile install from the public source."
+}

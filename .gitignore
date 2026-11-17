@@ -6,3 +6,5 @@ target/
 Python/
 .test-scripts/
 python_install_*.log
+node_modules/
+agentranch-dsh-plugin/release/
