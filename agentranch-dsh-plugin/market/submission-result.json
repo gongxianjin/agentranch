@@ -1,6 +1,17 @@
 {
-  "status": "PUSHED_REPO_PENDING_NPM",
-  "published": false,
+  "status": "PUBLISHED_GIT_PENDING_MARKET_SCAN",
+  "published": true,
+  "publication": {
+    "channel": "github-public-repo",
+    "date": "2026-11-17",
+    "repo": "https://github.com/gongxianjin/agentranch-dsh",
+    "branch": "main",
+    "commit": "18b221a",
+    "topics": ["agentranch", "dsh-plugin", "deepseek-hardness"],
+    "packageJsonAtRoot": true,
+    "publicVisibilityVerified": "anonymous GET api.github.com/repos/gongxianjin/agentranch-dsh/topics returned 200 with names",
+    "npmPublish": "NOT_RUN — npm signup page blocked by Cloudflare IP challenge (183.179.107.193 flagged as bot-adjacent); Git channel chosen per user decision 2026-11-17. npm remains the preferred channel if credentials become available later."
+  },
   "repoPush": {
     "date": "2026-11-17",
     "remote": "https://github.com/gongxianjin/agentranch.git",
@@ -26,7 +37,7 @@
     "note": "Repacked 2026-11-17 from merged tree 3295538 after release/ was found deleted; 22 files. Earlier VERIFICATION.md recorded 11861/40dc6c... from the pre-merge worktree build — differs because tar timestamps/compression are not byte-stable across pack runs; content source tree identical (commit 3295538)."
   },
   "blockers": [
-    "No authenticated npm account is available in this environment (npm whoami → ENEEDAUTH). npm publish requires the user to run npm login and authorize publication."
+    "DSH Bazaar daily scan has not run against the new repository yet; market discovery cannot be verified until the scan observes topic dsh-plugin (unknown cadence, assumed daily)."
   ],
-  "nextVerification": "After explicit user authorization: create/push the public GitHub repository, publish agentranch-dsh@0.1.0 to npm, wait for the DSH Bazaar daily scan, then verify discovery and a clean-profile install from the public source."
+  "nextVerification": "Wait for the DSH Bazaar scan, then query the official market index/search for agentranch-dsh and perform a clean-profile dsh plugin add from the public GitHub source; record scan date and install result here."
 }
