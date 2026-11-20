@@ -34,8 +34,8 @@ class WindowsPackagingCliTests(unittest.TestCase):
 
     def _make_fixture(self):
         for relative, content in {
-            "Cargo.toml": "[package]\nname = 'agentranch'\nversion = '0.2.0'\n",
-            "Cargo.lock": "version = 3\n\n[[package]]\nname = 'agentranch'\nversion = '0.2.0'\n\n[[package]]\nname = 'fixture-dependency'\nversion = '1.0.0'\nsource = 'registry+fixture'\n",
+            "Cargo.toml": "[package]\nname = 'agentranch'\nversion = '0.3.0'\n",
+            "Cargo.lock": "version = 3\n\n[[package]]\nname = 'agentranch'\nversion = '0.3.0'\n\n[[package]]\nname = 'fixture-dependency'\nversion = '1.0.0'\nsource = 'registry+fixture'\n",
             "rust-toolchain.toml": "[toolchain]\nchannel = '1.99.1'\n",
             "packaging/protocol-v1.md": "fixture protocol\n",
             "README.md": "# Synthetic fixture, not a product\n",
@@ -82,7 +82,7 @@ class WindowsPackagingCliTests(unittest.TestCase):
             "target": "x86_64-pc-windows-gnu",
             "toolchain": "1.99.1",
             "profile": "release",
-            "package_version": "0.2.0",
+            "package_version": "0.3.0",
             "executables": {
                 binary: {
                     "sha256": hashlib.sha256((self.binary_dir / binary).read_bytes()).hexdigest(),
@@ -206,9 +206,14 @@ class WindowsPackagingCliTests(unittest.TestCase):
             }
         inventory_path = self.work / "PYTHON-RUNTIME-INVENTORY.json"
         helper_content = b"# synthetic gateway helper fixture\n"
+        provision_helper_content = b"# synthetic provisioning helper fixture\n"
         self._add_source_file(
             "tools/paramiko_gateway.py", helper_content,
             version="gateway-helper-1", license_name="MIT",
+        )
+        self._add_source_file(
+            "tools/paramiko_provision.py", provision_helper_content,
+            version="provision-helper-1", license_name="MIT",
         )
         inventory_path.write_text(json.dumps({
             "schema": "ao-windows-python-runtime/1",
@@ -222,6 +227,13 @@ class WindowsPackagingCliTests(unittest.TestCase):
                 "sha256": hashlib.sha256(helper_content).hexdigest(),
                 "bytes": len(helper_content),
                 "version": "gateway-helper-1",
+                "license": "MIT",
+            },
+            "provision_helper": {
+                "relative": "tools/paramiko_provision.py",
+                "sha256": hashlib.sha256(provision_helper_content).hexdigest(),
+                "bytes": len(provision_helper_content),
+                "version": "provision-helper-1",
                 "license": "MIT",
             },
         }), encoding="utf-8")
@@ -256,7 +268,9 @@ class WindowsPackagingCliTests(unittest.TestCase):
                 "license": "LGPL-2.1" if is_paramiko else "PSF-2.0",
             }
         helper_content = b"# synthetic gateway helper fixture\n"
+        provision_helper_content = b"# synthetic provisioning helper fixture\n"
         self._add_source_file("tools/paramiko_gateway.py", helper_content)
+        self._add_source_file("tools/paramiko_provision.py", provision_helper_content)
         inventory = self.work / "PYTHON-CP314-RUNTIME-INVENTORY.json"
         inventory.write_text(json.dumps({
             "schema": "ao-windows-python-runtime/1", "platform": "windows-x86_64",
@@ -265,6 +279,10 @@ class WindowsPackagingCliTests(unittest.TestCase):
                 "relative": "tools/paramiko_gateway.py",
                 "sha256": hashlib.sha256(helper_content).hexdigest(), "bytes": len(helper_content),
                 "version": "gateway-helper-1", "license": "MIT",
+            }, "provision_helper": {
+                "relative": "tools/paramiko_provision.py",
+                "sha256": hashlib.sha256(provision_helper_content).hexdigest(), "bytes": len(provision_helper_content),
+                "version": "provision-helper-1", "license": "MIT",
             },
         }), encoding="utf-8")
         return runtime, inventory
@@ -316,6 +334,32 @@ class WindowsPackagingCliTests(unittest.TestCase):
         inventory.write_text(json.dumps(data), encoding="utf-8")
         self._assert_runtime_preflight_failure(runtime, inventory, "runtime PE architecture mismatch: python314.dll")
 
+    def test_inventory_bound_helpers_are_packaged_without_bundled_python_runtime(self):
+        helpers = {
+            "tools/paramiko_gateway.py": b"# synthetic gateway helper fixture\n",
+            "tools/paramiko_provision.py": b"# synthetic provisioning helper fixture\n",
+        }
+        for relative, content in helpers.items():
+            self._add_source_file(relative, content)
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        summary = json.loads(result.stdout)
+        package = Path(summary["package_dir"])
+        manifest = json.loads((package / "PACKAGE-MANIFEST.json").read_text(encoding="utf-8"))
+        self.assertIsNone(manifest["python_runtime"])
+        self.assertFalse((package / "runtime" / "python").exists())
+        self.assertFalse((package / "PYTHON-RUNTIME-INVENTORY.json").exists())
+        self.assertIn("Python/Paramiko runtime is not bundled", (package / "PACKAGE-NOTES.txt").read_text(encoding="utf-8"))
+        with zipfile.ZipFile(summary["zip"]) as bundle:
+            for relative, content in helpers.items():
+                self.assertEqual((package / relative).read_bytes(), content)
+                self.assertEqual(manifest["files"][relative]["sha256"], hashlib.sha256(content).hexdigest())
+                self.assertEqual(manifest["files"][relative]["bytes"], len(content))
+                self.assertEqual(bundle.read(f"{package.name}/{relative}"), content)
+
     def test_bundled_runtime_is_copied_and_hash_bound_without_launching_runtime(self):
         runtime, inventory = self._make_python_runtime_fixture()
         result = self._run(
@@ -339,6 +383,8 @@ class WindowsPackagingCliTests(unittest.TestCase):
             self.assertTrue(spec["license"])
         helper = package_dir / "tools" / "paramiko_gateway.py"
         self.assertEqual(helper.read_bytes(), b"# synthetic gateway helper fixture\n")
+        provision_helper = package_dir / "tools" / "paramiko_provision.py"
+        self.assertEqual(provision_helper.read_bytes(), b"# synthetic provisioning helper fixture\n")
         self.assertIn("Bundled Python runtime", (package_dir / "PACKAGE-NOTES.txt").read_text(encoding="utf-8"))
         self.assertIn("cp311-win_amd64", (package_dir / "PACKAGE-NOTES.txt").read_text(encoding="utf-8"))
         self.assertIn("4.0.0-fixture", (package_dir / "PACKAGE-NOTES.txt").read_text(encoding="utf-8"))
@@ -469,7 +515,7 @@ class WindowsPackagingCliTests(unittest.TestCase):
     def test_existing_zip_destination_is_rejected_without_overwrite(self):
         files = json.loads(self.inventory.read_text(encoding="utf-8"))["files"]
         source_digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        archive = self.output_parent / f"agentranch-0.2.0-windows-x86_64-release-{source_digest[:16]}.zip"
+        archive = self.output_parent / f"agentranch-0.3.0-windows-x86_64-release-{source_digest[:16]}.zip"
         archive.write_bytes(b"prior evidence")
         result = self._run()
         self.assertEqual(result.returncode, 2)
@@ -546,7 +592,7 @@ class WindowsPackagingCliTests(unittest.TestCase):
         files = json.loads(self.inventory.read_text(encoding="utf-8"))["files"]
         canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
         source_digest = hashlib.sha256(canonical).hexdigest()
-        existing = self.output_parent / f"agentranch-0.2.0-windows-x86_64-release-{source_digest[:16]}"
+        existing = self.output_parent / f"agentranch-0.3.0-windows-x86_64-release-{source_digest[:16]}"
         existing.mkdir()
         result = self._run()
         self.assertEqual(result.returncode, 2)
@@ -731,7 +777,7 @@ class WindowsPackagingCliTests(unittest.TestCase):
         self.assertEqual(list(self.output_parent.iterdir()), [])
 
     def test_build_identity_rejects_manifest_package_version_mismatch_before_output(self):
-        # Rewrite the manifest to a DIFFERENT version than the pinned 0.2.0 so
+        # Rewrite the manifest to a DIFFERENT version than the pinned 0.3.0 so
         # the mismatch check still exercises rejection (not a no-op rewrite).
         path = self.source / "Cargo.toml"
         path.write_text("[package]\nname = 'agentranch'\nversion = '9.9.9'\n", encoding="utf-8")
@@ -823,6 +869,24 @@ class WindowsPackagingCliTests(unittest.TestCase):
         self.assertIn("Source inventory closure mismatch", result.stderr)
         self.assertEqual(list(self.output_parent.iterdir()), [])
 
+    def test_protected_note_path_is_excluded_without_reading(self):
+        protected = self.source / ".test-scripts" / "note.txt"
+        protected.parent.mkdir(parents=True, exist_ok=True)
+        protected.write_bytes(b"protected synthetic content")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        package = Path(json.loads(result.stdout)["package_dir"])
+        self.assertFalse((package / ".test-scripts" / "note.txt").exists())
+
+    def test_superpowers_evidence_directory_is_excluded_from_source_closure(self):
+        protected = self.source / ".superpowers" / "secret-scan.json"
+        protected.parent.mkdir(parents=True, exist_ok=True)
+        protected.write_bytes(b"protected synthetic evidence")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        package = Path(json.loads(result.stdout)["package_dir"])
+        self.assertFalse((package / ".superpowers" / "secret-scan.json").exists())
+
     def test_readme_must_be_inventory_bound(self):
         inventory = json.loads(self.inventory.read_text(encoding="utf-8"))
         del inventory["files"]["README.md"]
@@ -830,6 +894,111 @@ class WindowsPackagingCliTests(unittest.TestCase):
         result = self._run()
         self.assertEqual(result.returncode, 2)
         self.assertIn("Incomplete source inventory", result.stderr)
+        self.assertEqual(list(self.output_parent.iterdir()), [])
+
+    def _make_provisioning_bundle_fixture(self):
+        bundle = self.work / "provisioning-bundle"
+        bundle.mkdir()
+        assets = {"aw-cli": b"worker", "libsqlite3.so.0": b"loader"}
+        for name, content in assets.items():
+            (bundle / name).write_bytes(content)
+        (bundle / "known_hosts").write_text("[worker.example]:22 ssh-ed25519 AAAAfixture\\n", encoding="ascii")
+        (bundle / "model.pem").write_text(
+            "-----BEGIN CERTIFICATE-----\\nfixture\\n-----END CERTIFICATE-----\\n",
+            encoding="ascii",
+        )
+        manifest = {
+            "schema": "worker-provision-assets/1",
+            "version": "0.3.0",
+            "worker": {
+                "path": "aw-cli", "bytes": len(assets["aw-cli"]),
+                "sha256": hashlib.sha256(assets["aw-cli"]).hexdigest(),
+            },
+            "loader": {
+                "path": "libsqlite3.so.0", "bytes": len(assets["libsqlite3.so.0"]),
+                "sha256": hashlib.sha256(assets["libsqlite3.so.0"]).hexdigest(),
+            },
+        }
+        (bundle / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (bundle / "provisioning-prerequisites.json").write_text(json.dumps({
+            "schema": "worker-provision-prerequisites/1",
+            "asset_manifest": "assets.json",
+            "asset_version": "0.3.0",
+            "known_hosts": "known_hosts",
+            "tls_certificate": "model.pem",
+        }), encoding="utf-8")
+        return bundle
+
+    def test_provisioning_bundle_requires_current_linux_build_provenance(self):
+        bundle = self._make_provisioning_bundle_fixture()
+        result = self._run("--provisioning-prerequisites-dir", str(bundle))
+        self.assertEqual(result.returncode, 2, "legacy hash-only bundle must not be packaged")
+        self.assertIn("Linux build provenance is required", result.stderr)
+        self.assertEqual(list(self.output_parent.iterdir()), [])
+
+    def _linux_provenance_args(self):
+        source = json.loads(self.inventory.read_text(encoding="utf-8"))["files"]
+        inputs = {name: source[name] for name in ("Cargo.toml", "Cargo.lock")}
+        input_path = self.work / "linux-build-input.json"
+        result_path = self.work / "linux-build-result.json"
+        input_path.write_text(json.dumps({
+            "command": ["cargo-zigbuild", "zigbuild", "--target", "x86_64-unknown-linux-gnu.2.35"],
+            "inputs": inputs,
+        }), encoding="utf-8")
+        result_path.write_text(json.dumps({"exit": 0, "source_unchanged": True,
+            "worker": {"bytes": 6, "sha256": hashlib.sha256(b"worker").hexdigest()}}), encoding="utf-8")
+        return ["--linux-build-input", str(input_path), "--linux-build-result", str(result_path)]
+
+    def test_provisioning_bundle_is_copied_and_manifest_bound(self):
+        bundle = self._make_provisioning_bundle_fixture()
+        result = self._run("--provisioning-prerequisites-dir", str(bundle), *self._linux_provenance_args())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        package = Path(json.loads(result.stdout)["package_dir"])
+        installed = package / "tools"
+        for relative in (
+            "provisioning-prerequisites.json", "assets.json", "aw-cli",
+            "libsqlite3.so.0", "known_hosts", "model.pem",
+        ):
+            self.assertEqual((installed / relative).read_bytes(), (bundle / relative).read_bytes())
+        manifest = json.loads((package / "PACKAGE-MANIFEST.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["provisioning"]["status"], "BUNDLED_HASH_BOUND")
+        self.assertEqual(manifest["provisioning"]["files"]["aw-cli"]["sha256"],
+                         hashlib.sha256(b"worker").hexdigest())
+
+    def test_linux_build_provenance_rejects_source_worker_target_and_result_drift(self):
+        bundle = self._make_provisioning_bundle_fixture()
+        variants = ("source", "worker", "target", "failed", "changed", "missing-source")
+        for variant in variants:
+            with self.subTest(variant=variant):
+                args = self._linux_provenance_args()
+                input_path, result_path = Path(args[1]), Path(args[3])
+                inputs = json.loads(input_path.read_text())
+                result = json.loads(result_path.read_text())
+                if variant == "source":
+                    inputs["inputs"]["Cargo.toml"]["sha256"] = "0" * 64
+                elif variant == "worker":
+                    result["worker"]["sha256"] = "0" * 64
+                elif variant == "target":
+                    inputs["command"][-1] = "x86_64-pc-windows-gnu"
+                elif variant == "failed":
+                    result["exit"] = 1
+                elif variant == "changed":
+                    result["source_unchanged"] = False
+                else:
+                    del inputs["inputs"]["Cargo.lock"]
+                input_path.write_text(json.dumps(inputs), encoding="utf-8")
+                result_path.write_text(json.dumps(result), encoding="utf-8")
+                observed = self._run("--provisioning-prerequisites-dir", str(bundle), *args)
+                self.assertEqual(observed.returncode, 2, observed.stderr)
+                self.assertIn("Linux build", observed.stderr)
+                self.assertEqual(list(self.output_parent.iterdir()), [])
+
+    def test_provisioning_bundle_rejects_asset_hash_drift_before_output(self):
+        bundle = self._make_provisioning_bundle_fixture()
+        (bundle / "aw-cli").write_bytes(b"drift")
+        result = self._run("--provisioning-prerequisites-dir", str(bundle))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("provisioning worker asset hash mismatch", result.stderr)
         self.assertEqual(list(self.output_parent.iterdir()), [])
 
 

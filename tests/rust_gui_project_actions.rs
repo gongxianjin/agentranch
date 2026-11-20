@@ -224,13 +224,29 @@ fn redo_fixture(root: &Path) -> (PathBuf, String) {
     (state, id)
 }
 
+fn click_text(app: &mut desktop::Workbench, ctx: &egui::Context, label: &str) {
+    for _ in 0..2 { frame(app, ctx, vec![]); }
+    let output = frame(app, ctx, vec![]);
+    let rect = texts(&output).into_iter()
+        .find(|(text, _)| text == label)
+        .map(|(_, rect)| rect)
+        .unwrap_or_else(|| panic!("navigation label not rendered: {label}"));
+    click(app, ctx, rect.center());
+    frame(app, ctx, vec![]);
+}
+
 fn app(state: &Path) -> (desktop::Workbench, egui::Context) {
     let ctx = egui::Context::default();
-    let app = desktop::Workbench::new(
+    let mut app = desktop::Workbench::new(
         ServiceOptions { mode: Mode::Real, state_dir: state.into(), worker_exe: env!("CARGO_BIN_EXE_aw-cli").into(), gateway_key: None, gateway_model_token: None },
         &ctx,
     ).unwrap();
     ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.0);
+    // These tests exercise the legacy six-step project wizard. Reach it through
+    // the same visible advanced navigation a user must use; do not toggle the
+    // private diagnostics flag as a test-only shortcut.
+    click_text(&mut app, &ctx, "高级 · 本地诊断");
+    click_text(&mut app, &ctx, "项目诊断");
     (app, ctx)
 }
 
@@ -271,8 +287,10 @@ fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
 }
 
 fn scroll(app: &mut desktop::Workbench, ctx: &egui::Context, delta: f32) {
+    // The real-mode onboarding panel occupies the top 450px; keep wheel input
+    // inside the project-detail scroll area so selectors below the fold remain reachable.
     frame(app, ctx, vec![
-        egui::Event::PointerMoved(egui::pos2(1040., 420.)),
+        egui::Event::PointerMoved(egui::pos2(1040., 900.)),
         egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0., delta),
@@ -585,24 +603,16 @@ fn wizard_rail_marks_progress_from_persisted_phase() {
 fn wizard_rail_reflects_test_failed_and_accepted_phases() {
     let temp = tempfile::tempdir().unwrap();
     let (state, id) = test_failed_fixture_with_endpoint(temp.path(), REASON_ENDPOINT, "gui-actions-w2");
-    let (mut app, ctx) = app(&state);
-    wait(&mut app, |snapshot| snapshot.projects.iter().any(|project| project.id == id && project.phase == "test_failed"));
-    assert_eq!(rail_marker(&mut app, &ctx, "④开发"), (true, false, false));
-    assert_eq!(rail_marker(&mut app, &ctx, "⑤测试与返修"), (false, true, false));
-    assert_eq!(rail_marker(&mut app, &ctx, "⑥人工验收"), (false, false, true));
-    drop(app);
+    let (mut failed_app, ctx) = app(&state);
+    wait(&mut failed_app, |snapshot| snapshot.projects.iter().any(|project| project.id == id && project.phase == "test_failed"));
+    assert_eq!(rail_marker(&mut failed_app, &ctx, "④开发"), (true, false, false));
+    assert_eq!(rail_marker(&mut failed_app, &ctx, "⑤测试与返修"), (false, true, false));
+    assert_eq!(rail_marker(&mut failed_app, &ctx, "⑥人工验收"), (false, false, true));
+    drop(failed_app);
 
     let temp2 = tempfile::tempdir().unwrap();
     let (state2, id2) = acceptance_then_accepted_state(temp2.path());
-    let (mut rail_app, rail_ctx) = {
-        let ctx = egui::Context::default();
-        let started = desktop::Workbench::new(
-            ServiceOptions { mode: Mode::Real, state_dir: state2.clone(), worker_exe: env!("CARGO_BIN_EXE_aw-cli").into(), gateway_key: None, gateway_model_token: None },
-            &ctx,
-        ).unwrap();
-        ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.0);
-        (started, ctx)
-    };
+    let (mut rail_app, rail_ctx) = app(&state2);
     wait(&mut rail_app, |snapshot| snapshot.projects.iter().any(|project| project.id == id2 && project.phase == "accepted"));
     assert_eq!(rail_marker(&mut rail_app, &rail_ctx, "⑥人工验收"), (true, false, false));
 }

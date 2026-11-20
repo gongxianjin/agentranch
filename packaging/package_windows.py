@@ -40,15 +40,18 @@ def safe_relative(root, relative):
     return path
 
 
-INVENTORY_IGNORED_DIRS = frozenset({'.git', '.claude', '__pycache__', 'dist', 'node_modules', 'target'})
+INVENTORY_IGNORED_DIRS = frozenset({'.git', '.claude', '.superpowers', '__pycache__', 'dist', 'node_modules', 'target'})
+INVENTORY_IGNORED_FILES = frozenset({'.test-scripts/note.txt'})
 
 
 def source_files(root):
     return {
-        path.relative_to(root).as_posix()
+        relative
         for path in root.rglob('*')
         if path.is_file() and not path.is_symlink()
-        and not any(part in INVENTORY_IGNORED_DIRS for part in path.relative_to(root).parts)
+        for relative in (path.relative_to(root).as_posix(),)
+        if relative not in INVENTORY_IGNORED_FILES
+        and not any(part in INVENTORY_IGNORED_DIRS for part in Path(relative).parts)
     }
 
 
@@ -89,6 +92,121 @@ FORBIDDEN_RUNTIME_NAMES = frozenset({
     'known_hosts', 'id_rsa', 'id_ed25519', 'id_ecdsa', 'private_key',
     'authorized_keys', 'credentials', 'secrets',
 })
+
+
+PROVISIONING_SCHEMA = 'worker-provision-prerequisites/1'
+PROVISIONING_ASSET_SCHEMA = 'worker-provision-assets/1'
+PROVISIONING_REQUIRED_FILES = ('provisioning-prerequisites.json', 'known_hosts', 'model.pem')
+
+
+def _provisioning_relative(relative, label):
+    require(
+        isinstance(relative, str)
+        and relative == PurePosixPath(relative).as_posix()
+        and not PurePosixPath(relative).is_absolute()
+        and relative
+        and '..' not in PurePosixPath(relative).parts
+        and ':' not in relative
+        and '\\\\' not in relative,
+        f'Unsafe provisioning {label} path',
+    )
+    return PurePosixPath(relative)
+
+
+def _provisioning_file(root, relative, label):
+    pure = _provisioning_relative(relative, label)
+    path = root / Path(*pure.parts)
+    require(path.resolve().is_relative_to(root.resolve()), f'Provisioning {label} escaped bundle')
+    require(path.is_file() and not path.is_symlink(), f'Provisioning {label} missing: {relative}')
+    return path
+
+
+def load_provisioning_bundle(bundle_dir, expected_version):
+    root = bundle_dir.resolve()
+    require(root.is_dir() and not root.is_symlink(), 'Provisioning bundle directory missing')
+    descriptor_path = root / 'provisioning-prerequisites.json'
+    require_file(descriptor_path, 'provisioning prerequisites descriptor')
+    try:
+        descriptor = json.loads(descriptor_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError('Provisioning prerequisites descriptor is invalid') from error
+    expected_descriptor = {'schema', 'asset_manifest', 'asset_version', 'known_hosts', 'tls_certificate'}
+    require(isinstance(descriptor, dict) and set(descriptor) == expected_descriptor,
+            'Provisioning prerequisites descriptor fields mismatch')
+    require(descriptor['schema'] == PROVISIONING_SCHEMA, 'Provisioning prerequisites schema mismatch')
+    require(descriptor['asset_version'] == expected_version, 'Provisioning asset version mismatch')
+    manifest_path = _provisioning_file(root, descriptor['asset_manifest'], 'asset manifest')
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError('Provisioning asset manifest is invalid') from error
+    require(isinstance(manifest, dict) and set(manifest) == {'schema', 'version', 'worker', 'loader'},
+            'Provisioning asset manifest fields mismatch')
+    require(manifest['schema'] == PROVISIONING_ASSET_SCHEMA and manifest['version'] == expected_version,
+            'Provisioning asset manifest version mismatch')
+    files = {
+        'provisioning-prerequisites.json': descriptor_path,
+        descriptor['asset_manifest']: manifest_path,
+        descriptor['known_hosts']: _provisioning_file(root, descriptor['known_hosts'], 'known_hosts'),
+        descriptor['tls_certificate']: _provisioning_file(root, descriptor['tls_certificate'], 'TLS certificate'),
+    }
+    require(files['known_hosts'].read_bytes(), 'Provisioning known_hosts is empty')
+    certificate = files[descriptor['tls_certificate']].read_bytes()
+    require(certificate and b'BEGIN CERTIFICATE' in certificate and b'END CERTIFICATE' in certificate,
+            'Provisioning TLS certificate is invalid')
+    for name in ('worker', 'loader'):
+        entry = manifest[name]
+        require(isinstance(entry, dict) and set(entry) == {'path', 'bytes', 'sha256'},
+                f'Provisioning {name} asset fields mismatch')
+        asset_path = _provisioning_file(root, entry['path'], f'{name} asset')
+        expected_sha = entry['sha256']
+        require(isinstance(expected_sha, str) and re.fullmatch(r'[0-9a-f]{64}', expected_sha),
+                f'Provisioning {name} asset hash is invalid')
+        expected_bytes = entry['bytes']
+        require(type(expected_bytes) is int and expected_bytes > 0,
+                f'Provisioning {name} asset byte count is invalid')
+        require(asset_path.stat().st_size == expected_bytes and digest(asset_path) == expected_sha,
+                f'provisioning {name} asset hash mismatch')
+        files[entry['path']] = asset_path
+    copied = {}
+    for relative, path in files.items():
+        _provisioning_relative(relative, 'file')
+        copied[relative] = {
+            'source': str(path),
+            'package_path': 'tools/' + relative,
+            'bytes': path.stat().st_size,
+            'sha256': digest(path),
+        }
+    return {'schema': PROVISIONING_SCHEMA, 'status': 'BUNDLED_HASH_BOUND',
+            'version': expected_version, 'files': copied}
+
+
+def verify_linux_build(input_path, result_path, source_files, provisioning):
+    require(input_path is not None and result_path is not None, 'Linux build provenance is required for provisioning assets')
+    require_file(input_path, 'Linux build input')
+    require_file(result_path, 'Linux build result')
+    inputs = json.loads(input_path.read_text(encoding='utf-8'))
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    require(result.get('exit') == 0 and result.get('source_unchanged') is True, 'Linux build did not complete against stable source')
+    command = inputs.get('command', [])
+    require(isinstance(command, list) and '--target' in command
+            and command[command.index('--target') + 1:command.index('--target') + 2] == ['x86_64-unknown-linux-gnu.2.35'],
+            'Linux build target mismatch')
+    recorded = inputs.get('inputs', {})
+    require(isinstance(recorded, dict), 'Linux build input inventory is invalid')
+    normalized = {name.replace('\\', '/'): entry for name, entry in recorded.items()}
+    expected = {name: entry for name, entry in source_files.items()
+                if name in ('Cargo.toml', 'Cargo.lock') or (name.startswith('src/') and name.endswith('.rs'))}
+    require(normalized == expected, 'Linux build source mismatch')
+    descriptor = json.loads(Path(provisioning['files']['provisioning-prerequisites.json']['source']).read_text(encoding='utf-8'))
+    manifest = json.loads(Path(provisioning['files'][descriptor['asset_manifest']]['source']).read_text(encoding='utf-8'))
+    worker = provisioning['files'][manifest['worker']['path']]
+    built = result.get('worker', {})
+    require(isinstance(built, dict) and all(built.get(key) == worker[key] for key in ('bytes', 'sha256')),
+            'Linux build worker mismatch')
+    return {'status': 'CURRENT_SOURCE_BUILD_BOUND', 'input_sha256': digest(input_path),
+            'result_sha256': digest(result_path), 'worker_sha256': worker['sha256'],
+            'capability_probe': 'REQUIRED_BY_REMOTE_PREFLIGHT_NOT_RUN_BY_PACKAGER'}
 
 
 def runtime_file(runtime_dir, relative):
@@ -165,6 +283,12 @@ def load_python_runtime(runtime_dir, inventory_path):
     require(isinstance(helper.get('bytes'), int) and helper['bytes'] >= 0, 'Python runtime helper byte count is invalid')
     require(isinstance(helper.get('version'), str) and helper['version'], 'Python runtime helper version is required')
     require(isinstance(helper.get('license'), str) and helper['license'], 'Python runtime helper license is required')
+    provision_helper = inventory.get('provision_helper')
+    require(isinstance(provision_helper, dict) and provision_helper.get('relative') == 'tools/paramiko_provision.py', 'Python provisioning helper contract is invalid')
+    require(isinstance(provision_helper.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', provision_helper['sha256']), 'Python provisioning helper hash is invalid')
+    require(isinstance(provision_helper.get('bytes'), int) and provision_helper['bytes'] >= 0, 'Python provisioning helper byte count is invalid')
+    require(isinstance(provision_helper.get('version'), str) and provision_helper['version'], 'Python provisioning helper version is required')
+    require(isinstance(provision_helper.get('license'), str) and provision_helper['license'], 'Python provisioning helper license is required')
     return {
         'schema': RUNTIME_SCHEMA,
         'platform': inventory['platform'],
@@ -173,6 +297,7 @@ def load_python_runtime(runtime_dir, inventory_path):
         'paramiko_version': paramiko_version,
         'files': {relative: dict(spec) for relative, spec in sorted(files.items())},
         'helper': dict(helper),
+        'provision_helper': dict(provision_helper),
     }
 
 
@@ -201,6 +326,9 @@ def main():
     parser.add_argument('--runtime-dir', type=Path, default=Path('C:/msys64/mingw64/bin'))
     parser.add_argument('--python-runtime-dir', type=Path)
     parser.add_argument('--python-runtime-inventory', type=Path)
+    parser.add_argument('--provisioning-prerequisites-dir', type=Path)
+    parser.add_argument('--linux-build-input', type=Path)
+    parser.add_argument('--linux-build-result', type=Path)
     parser.add_argument('--objdump', type=Path, default=Path('C:/msys64/mingw64/bin/objdump.exe'))
     parser.add_argument('--system-dir', type=Path, default=Path('C:/Windows/System32'))
     args = parser.parse_args()
@@ -225,16 +353,24 @@ def main():
         python_runtime['interpreter'] = 'runtime/python/python.exe'
         python_runtime['runtime_verification'] = 'NOT_RUN_BY_PACKAGER'
         python_runtime['rust_transport_wiring'] = 'NOT_IMPLEMENTED_BY_PACKAGER'
+    provisioning = None
+    if args.provisioning_prerequisites_dir is not None:
+        provisioning = load_provisioning_bundle(args.provisioning_prerequisites_dir, '0.3.0')
     source = json.loads(args.inventory.read_text(encoding='utf-8'))
     files = source['files']
     require(files and all(relative in files for relative in ('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'packaging/protocol-v1.md', 'README.md')), 'Incomplete source inventory')
     helper_in_inventory = 'tools/paramiko_gateway.py' in files
     verify_sources(root, files)
+    if provisioning is not None:
+        provisioning['linux_build'] = verify_linux_build(args.linux_build_input, args.linux_build_result, files, provisioning)
     if python_runtime is not None:
         require(helper_in_inventory, 'Bundled Python runtime requires inventory-bound Paramiko helper')
         helper_path = safe_relative(root, 'tools/paramiko_gateway.py')
         helper_spec = python_runtime['helper']
         require(digest(helper_path) == helper_spec['sha256'] and helper_path.stat().st_size == helper_spec['bytes'], 'Python runtime helper identity mismatch')
+        provision_helper_path = safe_relative(root, 'tools/paramiko_provision.py')
+        provision_helper_spec = python_runtime['provision_helper']
+        require(digest(provision_helper_path) == provision_helper_spec['sha256'] and provision_helper_path.stat().st_size == provision_helper_spec['bytes'], 'Python provisioning helper identity mismatch')
     canonical = json.dumps(files, sort_keys=True, separators=(',', ':')).encode('utf-8')
     source_digest = hashlib.sha256(canonical).hexdigest()
     context = cargo_context(root)
@@ -243,7 +379,7 @@ def main():
     require(identity.get('target') == 'x86_64-pc-windows-gnu', 'Build identity target mismatch')
     require(identity.get('metadata_sha256') == digest(args.metadata), 'Build identity metadata mismatch')
     require(identity.get('toolchain') == context['toolchain'] == '1.99.1', 'Build identity toolchain mismatch')
-    require(identity.get('package_version') == context['package_version'] == '0.2.0', 'Build identity package version mismatch')
+    require(identity.get('package_version') == context['package_version'] == '0.3.0', 'Build identity package version mismatch')
     require(files['Cargo.lock']['sha256'] == context['cargo_lock_sha256'], 'Cargo.lock context mismatch')
     require(files['Cargo.toml']['sha256'] == context['cargo_toml_sha256'], 'Cargo.toml context mismatch')
     require(files['rust-toolchain.toml']['sha256'] == context['rust_toolchain_sha256'], 'rust-toolchain context mismatch')
@@ -256,7 +392,7 @@ def main():
         require(binary_path.is_file() and not binary_path.is_symlink() and binary_path.read_bytes()[:2] == b'MZ', 'Release PE missing: ' + binary)
         spec = identity_executables[binary]
         require(spec.get('sha256') == digest(binary_path) and spec.get('bytes') == binary_path.stat().st_size, f'Executable identity drift: {binary}')
-    name = 'agentranch-0.2.0-windows-x86_64-' + args.profile + '-' + source_digest[:16]
+    name = 'agentranch-0.3.0-windows-x86_64-' + args.profile + '-' + source_digest[:16]
     output = output_parent / name
     archive = output_parent / (name + '.zip')
     existing_names = {path.name for path in output_parent.iterdir()} if output_parent.is_dir() else set()
@@ -288,7 +424,8 @@ def main():
         'live_ao_reason_model_verification': 'NOT_AUTHORIZED_NOT_RUN', 'executables': {
             binary: {'sha256': digest(args.binary_dir / binary), 'bytes': (args.binary_dir / binary).stat().st_size}
             for binary in ('agentranch.exe', 'aw-cli.exe')},
-        'imports': {}, 'runtime_dlls': [], 'dependencies': [], 'python_runtime': python_runtime}
+        'imports': {}, 'runtime_dlls': [], 'dependencies': [], 'python_runtime': python_runtime,
+        'provisioning': provisioning}
     try:
         for binary in ('agentranch.exe', 'aw-cli.exe'):
             shutil.copyfile(args.binary_dir / binary, output / binary)
@@ -372,13 +509,24 @@ def main():
             helper_destination = output / 'tools' / 'paramiko_gateway.py'
             helper_destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(safe_relative(root, 'tools/paramiko_gateway.py'), helper_destination)
+            provision_helper_destination = output / 'tools' / 'paramiko_provision.py'
+            shutil.copyfile(safe_relative(root, 'tools/paramiko_provision.py'), provision_helper_destination)
         if python_runtime is not None:
+            require(digest(provision_helper_destination) == python_runtime['provision_helper']['sha256'], 'Packaged Python provisioning helper identity drift')
             for relative, spec in python_runtime['files'].items():
                 source_path = runtime_file(args.python_runtime_dir, relative)
                 destination = output / 'runtime' / 'python' / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source_path, destination)
                 require(digest(destination) == spec['sha256'] and destination.stat().st_size == spec['bytes'], 'Packaged Python runtime identity drift: ' + relative)
+        if provisioning is not None:
+            for relative, spec in provisioning['files'].items():
+                destination = output / spec['package_path']
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                require(not destination.exists(), 'Provisioning destination already exists: ' + relative)
+                shutil.copyfile(spec['source'], destination)
+                require(digest(destination) == spec['sha256'] and destination.stat().st_size == spec['bytes'],
+                        'Packaged provisioning identity drift: ' + relative)
         shutil.copyfile(args.inventory, output / 'SOURCE-INVENTORY.json')
         if python_runtime is not None:
             shutil.copyfile(args.python_runtime_inventory, output / 'PYTHON-RUNTIME-INVENTORY.json')
@@ -392,7 +540,7 @@ def main():
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, destination)
         (output / 'PACKAGE-NOTES.txt').write_text(
-            'agentranch 0.2.0 - Windows x86_64 GNU\n'
+            'agentranch 0.3.0 - Windows x86_64 GNU\n'
             'Double-click agentranch.exe. Keep aw-cli.exe beside it.\n'
             'Local experience is a Rust controlled fixture, NOT real AO/Reason/model execution.\n'
             + ('Bundled Python runtime is included at runtime/python/ with hash-bound ABI/version/license inventory; use runtime/python/python.exe for the explicitly configured Paramiko gateway.\n'

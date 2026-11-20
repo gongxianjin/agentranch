@@ -1,14 +1,8 @@
-"""Run ONE project-work-v1 Manager dispatch within one credential lifetime.
+"""Run one project-work-v1 dispatch after six-field Worker onboarding.
 
-Extends live_manager_closure.py for the project-work flow:
-- stdin credential is the framed AW-GATEWAY-SECRETS/1 (key + model token),
-  matching read_gateway_secrets; both stay in memory only.
-- gateway identity pinned to the .221 ubuntu ordinary user stage-13 facts.
-- GUI flow: type gateway config path, type design.md path, click the
-  project-work dispatch button (one business dispatch only).
-- Store inspector checks the native-project/1 evidence chain, the artifact
-  package digest, and that no token bytes appear in any persisted record.
-Never provisions credentials, writes secrets to disk, or puts them in argv/env.
+The novice flow supplies Worker IP, root account/password, HTTPS model origin,
+API key, and model. Provisioning is performed by the Manager and its bundled
+Helper; this harness drives the owned GUI and verifies the fresh Store.
 """
 from __future__ import annotations
 
@@ -18,7 +12,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import sqlite3
 import subprocess
@@ -65,35 +59,131 @@ def wait_for_owned_foreground_robust(ui, hwnd, pid, timeout=15, poll_interval=0.
     raise ClosureCheckError("HUMAN_FOREGROUND_REQUIRED")
 
 
-GATEWAY_MAGIC = b"AW-GATEWAY-SECRETS/1\n"
-PINNED_HOST = "172.28.8.221"
-PINNED_USER = "ubuntu"
-PINNED_UID = 1000
-PINNED_GID = 1000
+ONBOARDING_MAGIC = b"AW-WORKER-ONBOARDING/1\n"
+SECRET_FIELD_MAX = 16 * 1024
+
+
+def discover_generated_gateway(state_root, before_outputs=()):
+    """Return the sole gateway generated during this onboarding run.
+
+    Only the Manager-owned provisioning subtree is searched.  Existing output
+    directories are supplied by the caller before the Manager starts, so an
+    old gateway can never be selected as the new connection.
+    """
+    root = Path(state_root).resolve()
+    provisioning = root / "provisioning"
+    if not provisioning.is_dir():
+        raise ClosureCheckError("generated_gateway_missing")
+    before = {Path(path).resolve() for path in before_outputs}
+    candidates = []
+    for gateway in provisioning.glob("*/gateway.json"):
+        if gateway.is_symlink() or not gateway.is_file():
+            continue
+        output = gateway.parent.resolve()
+        if output in before:
+            continue
+        candidates.append(gateway.resolve())
+    if not candidates:
+        raise ClosureCheckError("generated_gateway_missing")
+    if len(candidates) != 1:
+        raise ClosureCheckError("generated_gateway_ambiguous")
+    return candidates[0]
+
+
+ONBOARDING_FIELDS = (
+    "host", "root-user", "root-password", "model-base-url", "model-token", "model",
+)
+
+
+def _read_onboarding_field(field, session):
+    values = {
+        "host": session["host"],
+        "root-user": session["root_user"],
+        "root-password": session["root_password"],
+        "model-base-url": session["model_base_url"],
+        "model-token": session["model_token"],
+        "model": session["model"],
+    }
+    require(field in values, "unknown_onboarding_field")
+    value = values[field]
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def prepare_onboarding(args, secrets, evidence):
+    """Validate non-secret run inputs without requiring a Gateway path."""
+    root_password, model_token = secrets
+    require(0 < len(root_password) <= SECRET_FIELD_MAX, "root_password_bound")
+    require(0 < len(model_token) <= SECRET_FIELD_MAX, "model_token_bound")
+    require(args.host.strip() and args.root_user.strip() and args.model.strip(),
+            "onboarding_identity_required")
+    require(args.model_base_url.startswith("https://") and
+            "/" not in args.model_base_url[8:] and
+            "?" not in args.model_base_url and "#" not in args.model_base_url,
+            "onboarding_https_origin_required")
+    package = Path(args.package).expanduser().resolve()
+    require(package.is_dir(), "package_directory_missing")
+    manifest = manifest_json(args.package_manifest)
+    if "package_dir" in manifest:
+        require(Path(manifest["package_dir"]).resolve() == package,
+                "package_manifest_path_mismatch")
+    document = Path(args.document).expanduser().resolve()
+    require(document.is_file(), "design_document_missing")
+    document_facts = file_identity(document)
+    write_json_new(evidence / "onboarding-preflight.json", {
+        "schema": "worker-onboarding-preflight/1",
+        "host": args.host.strip(),
+        "root_user": args.root_user.strip(),
+        "model_base_url": args.model_base_url,
+        "model": args.model,
+        "document": document_facts,
+        "secret_fields": {"root_password": "memory_only", "model_token": "memory_only"},
+    })
+    state_root = evidence / "manager-state"
+    before = set()
+    provisioning = state_root / "provisioning"
+    if provisioning.is_dir():
+        before = {path.resolve() for path in provisioning.iterdir() if path.is_dir()}
+    return {
+        "mode": "onboarding",
+        "host": args.host.strip(),
+        "root_user": args.root_user.strip(),
+        "model_base_url": args.model_base_url,
+        "model": args.model,
+        "package": package,
+        "manifest": manifest,
+        "document": document,
+        "document_sha256": document_facts["sha256"],
+        "evidence": evidence,
+        "state_root": state_root,
+        "before_outputs": before,
+        "gateway": None,
+        "database": None,
+    }
 
 
 @contextlib.contextmanager
 def stdin_secrets_lease(stream):
-    """Read the framed secrets (key + model token) once, zero them after."""
-    raw = bytearray(stream.read(65537))
+    """Read root password + model token once, then zero the frame."""
+    raw = bytearray(stream.read(2 * SECRET_FIELD_MAX + len(ONBOARDING_MAGIC) + 8 + 1))
     try:
-        require(raw.startswith(GATEWAY_MAGIC), "framed_gateway_secrets_required")
-        offset = len(GATEWAY_MAGIC)
+        require(raw.startswith(ONBOARDING_MAGIC), "framed_onboarding_secrets_required")
+        offset = len(ONBOARDING_MAGIC)
 
         def read_field(offset):
+            require(offset + 4 <= len(raw), "truncated_secret_field")
             length = int.from_bytes(raw[offset:offset + 4], "big")
-            require(length > 0, "empty_secret_field")
+            require(0 < length <= SECRET_FIELD_MAX, "secret_field_bound")
             start, end = offset + 4, offset + 4 + length
             field = bytes(raw[start:end])
             require(len(field) == length, "truncated_secret_field")
             return field, end
 
-        key, offset = read_field(offset)
-        token, offset = read_field(offset)
+        root_password, offset = read_field(offset)
+        model_token, offset = read_field(offset)
         require(offset == len(raw), "trailing_bytes_in_secrets_frame")
-        require(0 < len(key) <= 65536, "gateway_key_bound")
-        require(0 < len(token) <= 16384, "model_token_bound")
-        yield key, token
+        yield root_password, model_token
     finally:
         raw[:] = b"\x00" * len(raw)
 
@@ -114,178 +204,137 @@ def manifest_json(path):
     return json.loads(raw)
 
 
+def read_remote_endpoint(sftp, endpoint_path):
+    """Read the endpoint config while hiding remote path details from evidence."""
+    try:
+        with sftp.open(endpoint_path, "rb") as stream:
+            raw = stream.read(65537)
+    except FileNotFoundError as exc:
+        raise ClosureCheckError("remote_model_endpoint_missing") from exc
+    require(len(raw) <= 65536, "remote_model_endpoint_oversized")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ClosureCheckError("remote_model_endpoint_invalid_json") from exc
+
+
 def file_identity(path):
     with Path(path).open("rb") as stream:
         return {"bytes": Path(path).stat().st_size,
                 "sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
 
 
-def prepare_existing(args, key, evidence):
-    """Read-only checks against the staged .221 deployment and package."""
-    evidence.mkdir(parents=True, exist_ok=True)  # open("x") below needs the parent
-    gateway_path = Path(args.gateway).resolve()
-    gateway = bounded_json(gateway_path)
-    require(gateway["schema"] == "native-ssh-gateway/1"
-            and gateway["host"] == PINNED_HOST and gateway["port"] == 22
-            and gateway["user"] == PINNED_USER and gateway["worker_id"] == "B",
-            "pinned_linux221_identity_required")
+def _refresh_generated_gateway(session):
+    """Bind dispatch inspection to the sole gateway made in this run."""
+    if session.get("database") is not None:
+        return True
+    path = discover_generated_gateway(session["state_root"], session["before_outputs"])
+    gateway = bounded_json(path)
+    output_root = path.parent.resolve()
     controller_path = Path(gateway["controller_config"]).resolve()
+    require(controller_path.parent == output_root, "generated_controller_path_escape")
     controller = bounded_json(controller_path)
-    require(controller["schema"] == "ao-reason-config/1" and controller["mode"] == "real"
-            and controller["role"] == "controller" and controller["deployment"] == gateway["deployment"],
-            "controller_gateway_mismatch")
     state = Path(controller["state_dir"]).resolve()
-    require(not state.exists(), "fresh_controller_state_required")
-    package = Path(args.package).resolve()
-    manifest = manifest_json(args.package_manifest)
-    if "package_dir" in manifest:
-        require(Path(manifest["package_dir"]).resolve() == package, "package_manifest_path_mismatch")
-    pinned_files = manifest.get("required_files") or manifest.get("files") or {}
-    package_facts = {}
-    for label, relative in (("manager", "agentranch.exe"), ("worker_cli", "aw-cli.exe"),
-                            ("helper", "tools/paramiko_gateway.py"), ("python", "runtime/python/python.exe")):
-        identity = file_identity(package / relative)
-        pinned = pinned_files[label] if label in pinned_files else pinned_files[relative]
-        require(identity == {"bytes": pinned["bytes"], "sha256": pinned["sha256"]}, "package_identity_mismatch")
-        package_facts[label] = identity
-    known_hosts = Path(gateway["known_hosts"]).resolve()
-    require(known_hosts.is_file(), "existing_known_hosts_required")
-    helper = load_module(Path(__file__).with_name("paramiko_gateway.py"), "project_closure_helper")
-    private_key = helper._load_private_key(bytes(key))
-    import paramiko
-    client = paramiko.SSHClient()
+    require(state.parent == output_root and state.name == "controller-state",
+            "generated_state_path_escape")
+    session.update(gateway_path=path, gateway=gateway, database=state / "controller.sqlite")
+    return True
+
+
+def require_current_preflight_admission(session):
+    """Require the current run's preflight ledger before dispatch input."""
+    state_root = Path(session["state_root"]).resolve()
+    ledger_path = state_root / "provisioning-ledger.json"
+    if ledger_path.is_symlink() or not ledger_path.is_file():
+        raise ClosureCheckError("current_preflight_missing")
     try:
-        client.load_host_keys(str(known_hosts))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(hostname=gateway["host"], port=gateway["port"], username=gateway["user"],
-                       pkey=private_key, allow_agent=False, look_for_keys=False,
-                       timeout=15, auth_timeout=15, banner_timeout=15)
-        with client.open_sftp() as sftp:
-            with sftp.open(gateway["remote_config"], "rb") as stream:
-                raw_cfg = stream.read(65537)
-            require(len(raw_cfg) <= 65536, "remote_config_oversized")
-            worker = json.loads(raw_cfg)
-            endpoint_path = str(PurePosixPath(gateway["remote_worker"]).parent / "model-endpoint.json")
-            with sftp.open(endpoint_path, "rb") as stream:
-                raw_endpoint = stream.read(65537)
-            endpoint = json.loads(raw_endpoint)
-        require(worker["schema"] == "native-worker-config/1"
-                and worker["deployment"] == gateway["deployment"] and worker["worker_id"] == "B"
-                and worker["artifact_sha256"] == gateway["artifact_sha256"],
-                "remote_worker_config_mismatch")
-        require(endpoint["schema"] == "model-endpoint/1"
-                and endpoint["base_url"].startswith("https://")
-                and endpoint["certificate_pem"].startswith("-----BEGIN CERTIFICATE-----"),
-                "remote_model_endpoint_config_mismatch")
-        import ssl
-        import socket
-        host_port = re.match(r"https://([^/:]+):(\d+)", endpoint["base_url"])
-        require(host_port is not None, "endpoint_url_unparseable")
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with socket.create_connection((host_port.group(1), int(host_port.group(2))), timeout=15) as sock:
-            with ctx.wrap_socket(sock) as tls:
-                der = tls.getpeercert(binary_form=True)
-        require(hashlib.sha256(der).hexdigest().lower()
-                == hashlib.sha256(ssl.PEM_cert_to_DER_cert(endpoint["certificate_pem"])).hexdigest().lower(),
-                "pinned_certificate_changed")
-        for name in ("remote_worker", "remote_config", "remote_library_path"):
-            require(re.fullmatch(r"/[A-Za-z0-9/_.-]+", gateway[name]) is not None
-                    and all(part not in (".", "..", "") for part in gateway[name].split("/")[1:]),
-                    "unsafe_remote_path")
-        worker_path = re.sub(r"[^A-Za-z0-9/_.-]", "", gateway["remote_worker"])
-        library_path = gateway["remote_library_path"]
-        library_file = library_path + "/libsqlite3.so.0"
-        command = (
-            'set -eu; test "$(id -u)" = 1000; test "$(id -g)" = 1000; test "$(id -un)" = ubuntu; '
-            f'test "$(sha256sum {worker_path} | cut -d\' \' -f1)" = "{gateway["artifact_sha256"]}"; '
-            f'test "$(wc -c < {worker_path})" -eq {int(gateway["artifact_bytes"])}; '
-            f'test "$(sha256sum {library_file} | cut -d\' \' -f1)" = "{gateway["remote_library_sha256"]}"; '
-            f"LD_LIBRARY_PATH={library_path} /lib64/ld-linux-x86-64.so.2 --list {worker_path} >/dev/null; "
-            f"LD_LIBRARY_PATH={library_path} {worker_path} --identity"
-        )
-        stdin, stdout, stderr = client.exec_command(command, timeout=30, get_pty=False)
-        stdin.close()
-        code, output, error = read_channel(stdout.channel)
-        require(code == 0, "remote_readonly_preflight_failed")
-        require(b'"binary":"aw-cli"' in output, "remote_cli_identity_missing")
-        transport = client.get_transport()
-        host_key = transport.get_remote_server_key()
-        write_json_new(evidence / "preflight.json", {
-            "schema": "manager-worker-readonly-preflight/1", "status": "PASS_READONLY_PREFLIGHT",
-            "host": gateway["host"], "user": gateway["user"], "uid": PINNED_UID, "gid": PINNED_GID,
-            "known_hosts": file_identity(known_hosts), "host_key_type": host_key.get_name(),
-            "host_key_sha256": hashlib.sha256(host_key.asbytes()).hexdigest(), "package": package_facts,
-            "source_sha256": manifest["source_sha256"], "artifact_sha256": gateway["artifact_sha256"],
-            "model_endpoint_certificate_pinned": True,
-            "remote_mutation": False, "wait_kind": "PARAMIKO_CHANNEL_ONLY",
-            "stdout_sha256": hashlib.sha256(output).hexdigest(),
-            "stderr_sha256": hashlib.sha256(error).hexdigest(),
-        })
-    finally:
-        client.close()
-    doc = Path(args.document).resolve()
-    require(doc.is_file(), "design_document_missing")
-    facts = file_identity(doc)
-    write_json_new(evidence / "document.json", {
-        "schema": "confirmed-design-document/1", "path": str(doc), **facts})
-    return {"gateway_path": gateway_path, "gateway": gateway, "database": state / "controller.sqlite",
-            "package": package, "evidence": evidence, "document": doc, "document_sha256": facts["sha256"]}
+        ledger = bounded_json(ledger_path)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ClosureCheckError("current_preflight_invalid") from exc
+    if not isinstance(ledger, dict) or ledger.get("schema") != "worker-provision-ledger/1":
+        raise ClosureCheckError("current_preflight_invalid")
+    if ledger.get("state") != "preflight":
+        raise ClosureCheckError("current_preflight_missing")
+    current_gateway = Path(session["gateway_path"]).resolve()
+    current_output = current_gateway.parent
+    try:
+        selected_output = Path(ledger["output_dir"]).resolve()
+        selected_gateway = Path(ledger["gateway_path"]).resolve()
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise ClosureCheckError("current_preflight_invalid") from exc
+    if selected_output != current_output or selected_gateway != current_gateway:
+        raise ClosureCheckError("current_preflight_mismatch")
+    if selected_gateway.name != "gateway.json" or selected_output.parent != state_root / "provisioning":
+        raise ClosureCheckError("current_preflight_invalid")
+    return ledger
+
+
+def close_manager_owned(ui, process, hwnd, evidence, timeout=15):
+    """Request owned WM_CLOSE, then observe a direct wait; never force exit."""
+    close_request = "ALREADY_EXITED"
+    if process.poll() is None:
+        close_request = "NO_OWNED_WINDOW"
+        if hwnd is not None and ui.owned_pid(hwnd) == process.pid:
+            close_request = (
+                "POSTED" if ui.user.PostMessageW(hwnd, ui.WM_CLOSE, 0, 0)
+                else "POST_FAILED"
+            )
+    code, completed = None, False
+    try:
+        code = process.wait(timeout=timeout)
+        completed = True
+    except subprocess.TimeoutExpired:
+        pass
+    write_json_new(evidence / "manager-exit.json", {
+        "pid": process.pid,
+        "exit_code": code,
+        "close_request": close_request,
+        "forced_owned_child_terminate": False,
+        "windows_manager_wait_completed": completed,
+        "process_disposition": "EXIT_CONFIRMED" if completed else "LEFT_OWNED_PROCESS_UNTERMINATED",
+        "linux_owner_wait": "NOT_INFERRED_FROM_WINDOWS_PROCESS_EXIT",
+    })
+    require(completed, "manager_shutdown_timeout")
+    require(code == 0, "manager_shutdown_failed")
 
 
 @contextlib.contextmanager
 def manager_session(secrets, prepared, evidence):
-    """Owned HWND GUI with the framed secrets on stdin; EOF before window wait."""
+    """Open the owned Manager with no credential-bearing argv/env/stdin."""
     require(os.name == "nt", "windows_manager_required")
-    _, token = secrets
+    root_password, model_token = secrets
     ui_path = Path(__file__).resolve().parents[1] / ".test-scripts/native-manager/config_only_direct_capture.py"
     ui = load_module(ui_path, "project_closure_owned_window")
     ui.user.SetProcessDpiAwarenessContext(ui.ctypes.c_void_p(-4))
     package = prepared["package"]
-    env = os.environ.copy()
-    env["PATH"] = str(package) + os.pathsep + env.get("PATH", "")
-    frame = GATEWAY_MAGIC + len(secrets[0]).to_bytes(4, "big") + secrets[0] \
-        + len(token).to_bytes(4, "big") + token
+    system_root = os.environ.get("SystemRoot", "")
+    env = {"SystemRoot": system_root, "PATH": str(package)}
     process, hwnd = None, None
+    state_root = evidence / "manager-state"
     with (evidence / "manager.stdout.log").open("xb") as output, (evidence / "manager.stderr.log").open("xb") as error:
         try:
             process = subprocess.Popen([str(package / "agentranch.exe"), "--real",
-                "--gateway-key-stdin", "--state-dir", str(evidence / "manager-state")],
-                cwd=str(package), env=env, stdin=subprocess.PIPE, stdout=output, stderr=error)
-            process.stdin.write(frame)
-            process.stdin.close()
+                "--state-dir", str(state_root)],
+                cwd=str(package), env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=error)
             hwnd = find_manager_window(ui, process.pid)
             initial = ui.capture(hwnd, process.pid, evidence / "window-initial.png")
             write_json_new(evidence / "manager-window.json", {
                 "pid": process.pid, "hwnd": hwnd, "initial": initial,
                 "visual_review": "REQUIRED_BEFORE_COORDINATE_ACTIONS",
-                "gateway_path": str(prepared["gateway_path"]),
                 "document_path": str(prepared["document"]),
-                "control": "Use action subcommand after inspecting each screenshot. One dispatch only.",
+                "control": "Type six fields from memory, inspect screenshots, provision once, then dispatch once.",
             })
             (evidence / "controls").mkdir(exist_ok=False)
-            yield {**prepared, "process": process, "hwnd": hwnd, "ui": ui, "token": token}
+            yield {**prepared, "process": process, "hwnd": hwnd, "ui": ui,
+                   "root_password": root_password, "model_token": model_token,
+                   "state_root": state_root, "gateway": None, "database": None}
         finally:
             if process is not None:
-                if process.poll() is None and hwnd is not None and ui.owned_pid(hwnd) == process.pid:
-                    ui.user.PostMessageW(hwnd, ui.WM_CLOSE, 0, 0)
-                forced = False
-                try:
-                    code = process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    process.terminate()
-                    forced = True
-                    code = process.wait(timeout=10)
-                write_json_new(evidence / "manager-exit.json", {
-                    "pid": process.pid, "exit_code": code, "forced_owned_child_terminate": forced,
-                    "windows_manager_wait_completed": True,
-                    "linux_owner_wait": "NOT_INFERRED_FROM_WINDOWS_PROCESS_EXIT"})
-                require(not forced and code == 0, "manager_shutdown_failed")
+                close_manager_owned(ui, process, hwnd, evidence)
 
 
 def drive_manager(session, control_timeout=900):
-    """Sequential queue: type gateway config, type design doc, dispatch once."""
+    """Sequential queue: fill onboarding, provision, then dispatch once."""
     evidence, ui = session["evidence"], session["ui"]
     process, hwnd = session["process"], session["hwnd"]
     deadline = time.monotonic() + control_timeout
@@ -297,27 +346,37 @@ def drive_manager(session, control_timeout=900):
                 continue
             command = bounded_json(path)
             action = command["action"]
-            require(action in ("click", "type-gateway", "type-document", "capture", "dispatch", "abort"),
+            require(action in ("click", "type-field", "provision", "type-document", "capture", "dispatch", "abort"),
                     "unsupported_gui_action")
             require(action != "abort", "operator_aborted")
-            if action in ("click", "dispatch"):
+            if action in ("click", "dispatch", "provision"):
                 x, y = command["x"], command["y"]
                 rect = ui.RECT()
                 require(ui.user.GetWindowRect(hwnd, ui.ctypes.byref(rect)), "window_rect_unavailable")
                 require(type(x) is int and type(y) is int and 0 <= x < rect.right - rect.left
                         and 0 <= y < rect.bottom - rect.top, "click_outside_owned_window")
                 if action == "dispatch":
-                    require(session["database"].is_file(), "configure_gateway_before_dispatch")
+                    _refresh_generated_gateway(session)
+                    require_current_preflight_admission(session)
+                    require(session["database"].is_file(), "provision_worker_before_dispatch")
                     with contextlib.closing(sqlite3.connect(session["database"].as_uri() + "?mode=ro", uri=True)) as db:
                         require(db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0,
                                 "fresh_store_required_before_dispatch")
                 wait_for_owned_foreground_robust(ui, hwnd, process.pid)
                 ui.click(hwnd, process.pid, x, y)
-            elif action in ("type-gateway", "type-document"):
+            elif action == "provision":
+                wait_for_owned_foreground_robust(ui, hwnd, process.pid)
+                ui.click(hwnd, process.pid, x, y)
+            elif action == "type-field":
+                field = command.get("field")
+                require(field in ONBOARDING_FIELDS, "unsupported_onboarding_field")
                 wait_for_owned_foreground_robust(ui, hwnd, process.pid)
                 ui.hotkey_ctrl_a(hwnd, process.pid)
-                ui.unicode_type(hwnd, process.pid,
-                                str(session["gateway_path"] if action == "type-gateway" else session["document"]))
+                ui.unicode_type(hwnd, process.pid, _read_onboarding_field(field, session))
+            elif action == "type-document":
+                wait_for_owned_foreground_robust(ui, hwnd, process.pid)
+                ui.hotkey_ctrl_a(hwnd, process.pid)
+                ui.unicode_type(hwnd, process.pid, str(session["document"]))
             image = ui.capture(hwnd, process.pid, evidence / (path.stem + ".png"))
             write_json_new(evidence / (path.stem + "-result.json"), {"action": action, "screenshot": image})
             handled.add(path.name)
@@ -489,11 +548,17 @@ def wait_for_admission(session, timeout=480):
     deadline = time.monotonic() + timeout
     facts = {"status": "NOT_ADMITTED", "reason": "controller_database_missing"}
     while time.monotonic() < deadline:
-        if session["database"].is_file():
+        if session.get("database") is None:
+            try:
+                _refresh_generated_gateway(session)
+            except ClosureCheckError as exc:
+                if str(exc) != "generated_gateway_missing":
+                    raise
+        if session.get("database") is not None and session["database"].is_file():
             gateway = session["gateway"]
             facts = inspect_project_store(session["database"], gateway["deployment"], gateway["worker_id"],
                                           gateway["artifact_sha256"], session["document_sha256"],
-                                          session["evidence"] / "manager-state", session["token"])
+                                          session["evidence"] / "manager-state", session["model_token"])
             if facts["status"] == "PASS_PROJECT_STORE_ADMISSION":
                 break
         require(session["process"].poll() is None, "manager_exited_before_admission")
@@ -504,6 +569,8 @@ def wait_for_admission(session, timeout=480):
 
 
 def run_project_closure(evidence, secrets, prepare, manager, dispatch, verify):
+    evidence = Path(evidence)
+    evidence.mkdir(parents=True, exist_ok=False)
     result = {"schema": "manager-project-closure/1", "status": "BLOCKED_OR_FAILED",
               "dispatch": "NOT_RUN", "store": "NOT_RUN", "credential_cleanup": "NOT_CONFIRMED"}
     stage = "credential_acquire"
@@ -535,6 +602,8 @@ def run_project_closure(evidence, secrets, prepare, manager, dispatch, verify):
     except Exception as exc:
         result["failed_stage"] = stage
         result["error_type"] = type(exc).__name__
+        if isinstance(exc, ClosureCheckError):
+            result["failure_reason"] = str(exc)
     finally:
         write_json_new(evidence / "result.json", result)
     return result
@@ -546,16 +615,20 @@ args_ref = []
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="One memory-only credential lifetime; one project dispatch")
+    run = commands.add_parser("run", help="One memory-only onboarding credential lifetime; one project dispatch")
     run.add_argument("--evidence-dir", required=True)
-    run.add_argument("--gateway", required=True)
+    run.add_argument("--host", required=True)
+    run.add_argument("--root-user", required=True)
+    run.add_argument("--model-base-url", required=True)
+    run.add_argument("--model", required=True)
     run.add_argument("--package", required=True)
     run.add_argument("--package-manifest", required=True)
     run.add_argument("--document", required=True)
-    run.add_argument("--key-stdin", action="store_true", required=True)
+    run.add_argument("--secrets-stdin", action="store_true", required=True)
     action = commands.add_parser("action", help="Control the owned Manager window after visual review")
     action.add_argument("--evidence-dir", required=True)
-    action.add_argument("--action", required=True, choices=("click", "type-gateway", "type-document", "capture", "dispatch", "abort"))
+    action.add_argument("--action", required=True, choices=("click", "type-field", "provision", "type-document", "capture", "dispatch", "abort"))
+    action.add_argument("--field", choices=("host", "root-user", "root-password", "model-base-url", "model-token", "model"))
     action.add_argument("--x", type=int)
     action.add_argument("--y", type=int)
     args = parser.parse_args(argv)
@@ -564,14 +637,15 @@ def main(argv=None):
             control = Path(args.evidence_dir).resolve() / "controls"
             require(control.is_dir(), "live_manager_controls_missing")
             index = len(list(control.glob("command-*.json"))) + 1
-            write_json_new(control / f"command-{index:04d}.json", {"action": args.action, "x": args.x, "y": args.y})
+            require(args.action != "type-field" or args.field is not None, "onboarding_field_required")
+            write_json_new(control / f"command-{index:04d}.json", {"action": args.action, "field": args.field, "x": args.x, "y": args.y})
             print(json.dumps({"status": "GUI_COMMAND_QUEUED", "sequence": index}))
             return 0
         args_ref.append(args)
         evidence = Path(args.evidence_dir).resolve()
         result = run_project_closure(evidence,
             lambda: stdin_secrets_lease(sys.stdin.buffer),
-            lambda secrets, ev: prepare_existing(args_ref[0], secrets[0], ev),
+            lambda secrets, ev: prepare_onboarding(args_ref[0], secrets, ev),
             manager_session,
             drive_manager,
             wait_for_admission)

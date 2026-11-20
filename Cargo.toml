@@ -1,6 +1,6 @@
 [package]
 name = "agentranch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "agentranch: native Windows manager + Linux agent-worker workbench"
@@ -13,7 +13,7 @@ gui = ["dep:eframe"]
 
 [dependencies]
 anyhow = "1"
-eframe = { version = "=0.37.0", optional = true, default-features = false, features = ["default_fonts", "system_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "=0.37.0", optional = true, default-features = false, features = ["clipboard", "default_fonts", "system_fonts", "glow", "x11", "wayland"] }
 hex = "0.4"
 hmac = "0.12"
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "json"] }
@@ -24,7 +24,7 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_UI_Controls_Dialogs"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_UI_Controls_Dialogs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

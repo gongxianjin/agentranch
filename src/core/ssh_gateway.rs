@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{io::Write, path::{Path, PathBuf}, process::{Command, Stdio}, time::Duration};
+use std::{io::{Read, Write}, path::{Path, PathBuf}, process::{Command, Stdio}, sync::{Arc, mpsc, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 const PARAMIKO_MAGIC: &[u8] = b"AO-PARAMIKO-GATEWAY/1\n";
 const PARAMIKO_MAX_METADATA: usize = 64 * 1024;
@@ -41,7 +41,7 @@ fn bundled_python_interpreter() -> Result<PathBuf> {
     let parent=executable.parent().context("current executable directory unavailable")?;
     Ok(parent.join(PARAMIKO_RUNTIME))
 }
-use super::{protocol::{Envelope,ExecutionIdentity},store::Store};
+use super::{protocol::{Envelope,ExecutionIdentity},session_credentials::CredentialLease,store::Store};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +123,7 @@ pub struct SshWorkerTransport {
     interpreter:PathBuf,
     private_key:Vec<u8>,
     model_token:Vec<u8>,
+    cancel:Option<Arc<AtomicBool>>,
 }
 impl SshWorkerTransport {
     pub fn new(config:SshGatewayConfig)->Result<Self>{
@@ -139,25 +140,48 @@ impl SshWorkerTransport {
         let interpreter=bundled_python_interpreter()?;
         Self::with_paramiko_runtime_token(config,helper,interpreter,private_key,model_token)
     }
+    /// Consume one in-process lease into this short-lived transport only.
+    pub fn with_credential_lease(config:SshGatewayConfig,helper:PathBuf,lease:CredentialLease,require_token:bool)->Result<Self>{
+        Self::with_credential_lease_inner(config,helper,bundled_python_interpreter()?,lease,require_token,None)
+    }
+    pub fn with_credential_lease_cancellable(config:SshGatewayConfig,helper:PathBuf,lease:CredentialLease,require_token:bool,cancel:Arc<AtomicBool>)->Result<Self>{
+        Self::with_credential_lease_inner(config,helper,bundled_python_interpreter()?,lease,require_token,Some(cancel))
+    }
+    #[doc(hidden)]
+    pub fn with_credential_lease_for_test(config:SshGatewayConfig,helper:PathBuf,interpreter:PathBuf,lease:CredentialLease,require_token:bool)->Result<Self>{
+        Self::with_credential_lease_inner(config,helper,interpreter,lease,require_token,None)
+    }
+    fn with_credential_lease_inner(config:SshGatewayConfig,helper:PathBuf,interpreter:PathBuf,lease:CredentialLease,require_token:bool,cancel:Option<Arc<AtomicBool>>)->Result<Self>{
+        ensure!(lease.worker_key_len()>0,"Paramiko private key is unavailable");
+        ensure!(!require_token||lease.has_model_token(),"model token is unavailable");
+        let (private_key,model_token)=lease.into_transport_secrets();
+        Self::with_paramiko_runtime_secrets(config,helper,interpreter,private_key,model_token,require_token,cancel)
+    }
     pub fn with_paramiko_runtime(config:SshGatewayConfig,helper:PathBuf,interpreter:PathBuf,private_key:Vec<u8>)->Result<Self>{
-        config.validate()?;
-        ensure!(helper.is_absolute(),"Paramiko helper path must be absolute");
-        ensure!(helper.is_file(),"Paramiko helper script is missing");
-        if cfg!(windows) { ensure!(interpreter.is_file(),"bundled Python runtime is missing: runtime/python/python.exe"); }
-        ensure!(!private_key.is_empty(),"Paramiko private key is unavailable");
-        ensure!(private_key.len()<=PARAMIKO_MAX_KEY,"Paramiko private key is oversized");
-        Ok(Self{config,helper,interpreter,private_key,model_token:Vec::new()})
+        Self::with_paramiko_runtime_inner(config,helper,interpreter,private_key,Vec::new(),false,None)
     }
     pub fn with_paramiko_runtime_token(config:SshGatewayConfig,helper:PathBuf,interpreter:PathBuf,private_key:Vec<u8>,model_token:Vec<u8>)->Result<Self>{
+        Self::with_paramiko_runtime_inner(config,helper,interpreter,private_key,model_token,true,None)
+    }
+    fn with_paramiko_runtime_secrets(config:SshGatewayConfig,helper:PathBuf,interpreter:PathBuf,mut private_key:super::provision::SecretBytes,mut model_token:Option<super::provision::SecretBytes>,require_token:bool,cancel:Option<Arc<AtomicBool>>)->Result<Self>{
+        Self::validate_constructor(&config,&helper,&interpreter,private_key.len(),model_token.as_ref().map_or(0,|token|token.len()),require_token)?;
+        let private_key=private_key.drain_bytes();
+        let model_token=model_token.as_mut().map(super::provision::SecretBytes::drain_bytes).unwrap_or_default();
+        Ok(Self{config,helper,interpreter,private_key,model_token,cancel})
+    }
+    fn with_paramiko_runtime_inner(config:SshGatewayConfig,helper:PathBuf,interpreter:PathBuf,private_key:Vec<u8>,model_token:Vec<u8>,require_token:bool,cancel:Option<Arc<AtomicBool>>)->Result<Self>{
+        Self::validate_constructor(&config,&helper,&interpreter,private_key.len(),model_token.len(),require_token)?;
+        Ok(Self{config,helper,interpreter,private_key,model_token,cancel})
+    }
+    fn validate_constructor(config:&SshGatewayConfig,helper:&Path,interpreter:&Path,private_key_len:usize,model_token_len:usize,require_token:bool)->Result<()> {
         config.validate()?;
         ensure!(helper.is_absolute(),"Paramiko helper path must be absolute");
         ensure!(helper.is_file(),"Paramiko helper script is missing");
         if cfg!(windows) { ensure!(interpreter.is_file(),"bundled Python runtime is missing: runtime/python/python.exe"); }
-        ensure!(!private_key.is_empty(),"Paramiko private key is unavailable");
-        ensure!(private_key.len()<=PARAMIKO_MAX_KEY,"Paramiko private key is oversized");
-        ensure!(!model_token.is_empty(),"model token is unavailable");
-        ensure!(model_token.len()<=PARAMIKO_MAX_TOKEN,"model token is oversized");
-        Ok(Self{config,helper,interpreter,private_key,model_token})
+        ensure!(private_key_len>0,"Paramiko private key is unavailable");
+        ensure!(private_key_len<=PARAMIKO_MAX_KEY,"Paramiko private key is oversized");
+        if require_token { ensure!(model_token_len>0,"model token is unavailable");ensure!(model_token_len<=PARAMIKO_MAX_TOKEN,"model token is oversized"); }
+        Ok(())
     }
     pub fn command_for_test(&self)->Result<Command>{
         self.build_command()
@@ -217,9 +241,14 @@ impl SshWorkerTransport {
 }
 impl WorkerTransport for SshWorkerTransport {
     fn exchange(&mut self,request:&[u8],timeout_secs:u64)->Result<TransportOutput>{
+        self.exchange_stream(request,timeout_secs,&mut |_| {})
+    }
+    fn exchange_stream(&mut self,request:&[u8],timeout_secs:u64,emit:&mut dyn FnMut(super::live_output::LiveOutput))->Result<TransportOutput>{
+        ensure!(!self.cancel.as_ref().is_some_and(|flag|flag.load(Ordering::Acquire)),"transport cancelled before launch");
         let mut command=self.build_command()?;
+        ensure!(!self.cancel.as_ref().is_some_and(|flag|flag.load(Ordering::Acquire)),"transport cancelled before request frame");
         let frame=self.request_frame(request)?;
-        exchange_process_budgeted(&mut command,&frame,Duration::from_secs(timeout_secs),self.config.launch_mode == GatewayLaunchMode::DelegatedUserService)
+        exchange_process_budgeted(&mut command,&frame,Duration::from_secs(timeout_secs),self.config.launch_mode == GatewayLaunchMode::DelegatedUserService,self.cancel.as_deref(),Some(emit))
     }
 }
 impl Drop for SshWorkerTransport {
@@ -289,7 +318,15 @@ impl GatewayResult {
 }
 #[derive(Clone,Debug)]
 pub struct TransportOutput {pub stdout:Vec<u8>,pub stderr:Vec<u8>,pub exit_code:Option<i32>,pub failure:Option<String>}
-pub trait WorkerTransport {fn exchange(&mut self,request:&[u8],timeout_secs:u64)->Result<TransportOutput>;
+pub trait WorkerTransport {
+    fn exchange(&mut self,request:&[u8],timeout_secs:u64)->Result<TransportOutput>;
+    fn exchange_stream(&mut self,request:&[u8],timeout_secs:u64,_emit:&mut dyn FnMut(super::live_output::LiveOutput))->Result<TransportOutput> {
+        self.exchange(request,timeout_secs)
+    }
+}
+impl<T:WorkerTransport+?Sized> WorkerTransport for Box<T> {
+    fn exchange(&mut self,request:&[u8],timeout_secs:u64)->Result<TransportOutput>{(**self).exchange(request,timeout_secs)}
+    fn exchange_stream(&mut self,request:&[u8],timeout_secs:u64,emit:&mut dyn FnMut(super::live_output::LiveOutput))->Result<TransportOutput>{(**self).exchange_stream(request,timeout_secs,emit)}
 }
 #[derive(Clone)]
 struct CaptureOutcome { bytes:Vec<u8>, overflow:bool, error:Option<String> }
@@ -342,7 +379,11 @@ fn collect_capture(
 }
 
 pub fn exchange_process(command:&mut Command,request:&[u8],timeout:Duration)->Result<TransportOutput>{
-    exchange_process_budgeted(command,request,timeout,false)
+    exchange_process_budgeted(command,request,timeout,false,None,None)
+}
+
+pub fn exchange_process_stream(command:&mut Command,request:&[u8],timeout:Duration,emit:&mut dyn FnMut(super::live_output::LiveOutput))->Result<TransportOutput>{
+    exchange_process_budgeted(command,request,timeout,false,None,Some(emit))
 }
 
 fn transport_deadline(started:std::time::Instant,io_ready:std::time::Instant,timeout:Duration,delegated:bool)->std::time::Instant {
@@ -361,33 +402,84 @@ mod deadline_tests {
     }
 }
 
-fn exchange_process_budgeted(command:&mut Command,request:&[u8],timeout:Duration,delegated:bool)->Result<TransportOutput>{
+fn exchange_process_budgeted(command:&mut Command,request:&[u8],timeout:Duration,delegated:bool,cancel:Option<&AtomicBool>,mut emit:Option<&mut dyn FnMut(super::live_output::LiveOutput)>)->Result<TransportOutput>{
+    ensure!(!cancel.is_some_and(|flag|flag.load(Ordering::Acquire)),"transport cancelled before spawn");
     let started=std::time::Instant::now();
     let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("spawn worker transport process")?;
     let stdin=child.stdin.take().context("transport stdin unavailable")?;
     let stdout=child.stdout.take().context("transport stdout unavailable")?;
     let stderr=child.stderr.take().context("transport stderr unavailable")?;
+    ensure!(!cancel.is_some_and(|flag|flag.load(Ordering::Acquire)),"transport cancelled before request write");
     let request=request.to_vec();
     let writer=std::thread::spawn(move||{let mut stdin=stdin;let result=stdin.write_all(&request).map_err(|error|error.to_string());drop(stdin);result});
     let mut stdout=Some(capture_bounded(stdout,1024*1024));
-    let mut stderr=Some(capture_bounded(stderr,64*1024));
+    let (live_tx, live_rx) = mpsc::channel::<super::live_output::LiveOutput>();
+    let mut stderr_reader = stderr;
+    let stderr_state = std::sync::Arc::new(std::sync::Mutex::new(CaptureOutcome{bytes:Vec::new(),overflow:false,error:None}));
+    let stderr_shared = stderr_state.clone();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut raw = [0_u8; 8192];
+        let mut decoder = super::live_output::LiveLines::default();
+        let mut live_ok = true;
+        let mut diagnostic = |bytes: &[u8]| {
+            if let Ok(mut state) = stderr_shared.lock() {
+                let available = (64_usize * 1024).saturating_sub(state.bytes.len());
+                let keep = available.min(bytes.len());
+                state.bytes.extend_from_slice(&bytes[..keep]);
+                state.overflow |= keep < bytes.len();
+            }
+        };
+        loop {
+            let decoded = match stderr_reader.read(&mut raw) {
+                Ok(0) => {
+                    if live_ok && decoder.finish(&mut diagnostic).is_err() {
+                        let _ = live_tx.send(super::live_output::LiveOutput::Error("输出连接中断；保留已有输出。".into()));
+                    }
+                    break;
+                }
+                Ok(count) if live_ok => decoder.push(&raw[..count], &mut |event| {let _ = live_tx.send(event);}, &mut diagnostic),
+                Ok(count) => {diagnostic(&raw[..count]); Ok(())},
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    if let Ok(mut state) = stderr_shared.lock() {state.error = Some(error.to_string());}
+                    let _ = live_tx.send(super::live_output::LiveOutput::Error("输出读取失败；保留已有输出。".into()));
+                    break;
+                }
+            };
+            if decoded.is_err() {
+                live_ok = false;
+                let _ = live_tx.send(super::live_output::LiveOutput::Error("输出格式不完整；保留已有输出。".into()));
+            }
+        }
+    });
+    let mut stderr=Some((stderr_handle, stderr_state));
     let deadline=transport_deadline(started,std::time::Instant::now(),timeout,delegated);
     let mut timed_out=false;
+    let mut cancelled=false;
     let status=loop {
+        while let Ok(event) = live_rx.try_recv() { if let Some(callback) = emit.as_deref_mut() { callback(event); } }
         if let Some(status)=child.try_wait()? { break status; }
-        if std::time::Instant::now()>=deadline {
-            timed_out=true;
+        if cancel.is_some_and(|flag|flag.load(Ordering::Acquire)) || std::time::Instant::now()>=deadline {
+            cancelled=cancel.is_some_and(|flag|flag.load(Ordering::Acquire));
+            timed_out=!cancelled;
             let _=child.kill();
-            break child.wait().context("wait after transport timeout")?;
+            break child.wait().context("wait after transport cancellation/timeout")?;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    while !writer.is_finished() && std::time::Instant::now()<deadline { std::thread::sleep(Duration::from_millis(2)); }
+    while !writer.is_finished() && std::time::Instant::now()<deadline {
+        while let Ok(event) = live_rx.try_recv() { if let Some(callback) = emit.as_deref_mut() { callback(event); } }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    while let Ok(event) = live_rx.try_recv() { if let Some(callback) = emit.as_deref_mut() { callback(event); } }
     let writer_error=if writer.is_finished() { writer.join().ok().and_then(Result::err) } else { Some("transport stdin deadline exceeded".into()) };
+    while let Ok(event) = live_rx.try_recv() { if let Some(callback) = emit.as_deref_mut() { callback(event); } }
     let stdout=collect_capture(&mut stdout,deadline,"stdout");
     let stderr=collect_capture(&mut stderr,deadline,"stderr");
+    while let Ok(event) = live_rx.try_recv() { if let Some(callback) = emit.as_deref_mut() { callback(event); } }
     let stream_timeout=stdout.error.as_deref().is_some_and(|value|value.contains("deadline exceeded")) || stderr.error.as_deref().is_some_and(|value|value.contains("deadline exceeded"));
-    let failure=if timed_out||stream_timeout||writer_error.is_some(){Some("transport timeout".into())}
+    let failure=if cancelled {Some("transport cancelled during Manager disconnect".into())}
+        else if timed_out||stream_timeout||writer_error.is_some(){Some("transport timeout".into())}
         else if stdout.error.is_some()||stderr.error.is_some(){Some("transport stream reader failed".into())}
         else if stdout.overflow||stderr.overflow{Some("transport stream bound exceeded".into())}
         else if !status.success(){Some(format!("transport exited {}: {}",status,String::from_utf8_lossy(&stderr.bytes).trim()))}
@@ -426,6 +518,9 @@ fn consume_events(raw:&[u8],request:&GatewayRequest,store:&mut Store,now:u64,res
     Ok(())
 }
 pub fn run_once<T:WorkerTransport>(config:&SshGatewayConfig,request:&GatewayRequest,store:&mut Store,transport:&mut T,now:u64)->Result<GatewayResult>{
+    run_once_stream(config,request,store,transport,now,&mut |_| {})
+}
+pub fn run_once_stream<T:WorkerTransport>(config:&SshGatewayConfig,request:&GatewayRequest,store:&mut Store,transport:&mut T,now:u64,emit:&mut dyn FnMut(super::live_output::LiveOutput))->Result<GatewayResult>{
     config.validate()?;request.validate(config,store)?;
     if let Some(result)=admitted_result(store,request)?{return Ok(result);}
     store.validate_gateway_start(&request.start,now)?;
@@ -434,7 +529,7 @@ pub fn run_once<T:WorkerTransport>(config:&SshGatewayConfig,request:&GatewayRequ
     store.bind(&request.identity.run_id,request.identity.attempt,&request.identity.epoch,session)?;
     ensure!(store.run(&request.identity.run_id)?.execution_identity(&config.deployment)?==request.identity,"bound gateway identity mismatch");
     let mut frame=serde_json::to_vec(&request.start)?;frame.push(b'\n');
-    let output=transport.exchange(&frame,config.timeout_secs);
+    let output=transport.exchange_stream(&frame,config.timeout_secs,emit);
     // Envelope freshness is checked at arrival, not at dispatch: the worker
     // signs its terminal report only after the run finishes (a real model
     // call can take most of the exchange window), so verifying against the

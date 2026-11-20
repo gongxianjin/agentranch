@@ -6,12 +6,14 @@ use agentranch::core::service::{ServiceHandle, ServiceOptions, UiCommand};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc, time::{Duration, Instant}};
 
-fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+fn fixture() -> (tempfile::TempDir, std::path::PathBuf) { fixture_with_slots(1) }
+
+fn fixture_with_slots(slots: u32) -> (tempfile::TempDir, std::path::PathBuf) {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("test.key"), "07".repeat(32)).unwrap();
     let controller = json!({"schema":"ao-reason-config/1","mode":"real","role":"controller","deployment":"manager-test",
         "state_dir":"state",
-        "nodes":[{"id":"B","address":"B","key_file":"test.key","slots":1,
+        "nodes":[{"id":"B","address":"B","key_file":"test.key","slots":slots,
             "templates":["sum-v1","project-work-v1"],"admitted":true}]});
     std::fs::write(root.path().join("controller.json"), serde_json::to_vec(&controller).unwrap()).unwrap();
     let config = json!({"schema":"native-ssh-gateway/1","deployment":"manager-test","worker_id":"B","host":"b.example","port":22,"user":"worker",
@@ -49,6 +51,27 @@ fn wait_for(service: &mut ServiceHandle, request: u64) -> agentranch::core::serv
     }
 }
 
+fn wait_for_stop(service: &mut ServiceHandle) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while service.snapshot().running {
+        assert!(Instant::now() < until, "service did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_no_secret_in_durable_files(root: &std::path::Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() { assert_no_secret_in_durable_files(&entry.path())?; }
+        else if entry.file_type()?.is_file() {
+            let content = std::fs::read(entry.path())?;
+            anyhow::ensure!(!content.windows(b"sk-synthetic-token".len()).any(|window| window == b"sk-synthetic-token"), "model token persisted in {}", entry.path().display());
+            anyhow::ensure!(!content.windows(b"07070707".len()).any(|window| window == b"07070707"), "private key bytes persisted in {}", entry.path().display());
+        }
+    }
+    Ok(())
+}
+
 fn spawn_service(root: &tempfile::TempDir, with_credentials: bool) -> ServiceHandle {
     stage_transport_runtime();
     ServiceHandle::spawn(ServiceOptions {
@@ -58,6 +81,15 @@ fn spawn_service(root: &tempfile::TempDir, with_credentials: bool) -> ServiceHan
         gateway_key: with_credentials.then(|| b"07".repeat(32)),
         gateway_model_token: with_credentials.then(|| b"sk-synthetic-token".to_vec()),
     }, Arc::new(|| {})).unwrap()
+}
+
+#[test]
+fn durable_secret_scan_rejects_nested_file() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested/state");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("leak.bin"), b"sk-synthetic-token").unwrap();
+    assert!(assert_no_secret_in_durable_files(root.path()).is_err(), "recursive scan must examine nested durable files");
 }
 
 #[test]
@@ -76,6 +108,36 @@ fn project_dispatch_reads_document_and_creates_signed_project_run() {
     assert_eq!(result["status"], "unknown");
     assert_eq!(result["slot_reserved"], true);
     service.stop();
+}
+
+#[test]
+fn dispatch_project_reuses_session_credentials_without_persisting_them() {
+    let (root, path) = fixture_with_slots(2);
+    let first = root.path().join("first.md");
+    let second = root.path().join("second.md");
+    std::fs::write(&first, "# 第一份设计\n").unwrap();
+    std::fs::write(&second, "# 第二份设计\n").unwrap();
+    let mut service = spawn_service(&root, true);
+    let configure = service.try_submit(UiCommand::GatewayConfigure { config_path: path }).unwrap();
+    wait_for(&mut service, configure).result.unwrap();
+
+    let request_one = service.try_submit(UiCommand::GatewayDispatchProject { worker_id: "B".into(), doc_path: first }).unwrap();
+    let first = wait_for(&mut service, request_one).result.unwrap();
+    let request_two = service.try_submit(UiCommand::GatewayDispatchProject { worker_id: "B".into(), doc_path: second }).unwrap();
+    let second = wait_for(&mut service, request_two).result.unwrap();
+
+    assert_eq!(first["status"], "unknown");
+    assert_eq!(second["status"], "unknown");
+    assert_ne!(first["run_id"], second["run_id"]);
+    assert_eq!(first["slot_reserved"], true);
+    assert_eq!(second["slot_reserved"], true);
+
+    service.disconnect();
+    assert!(matches!(service.try_submit(UiCommand::GatewayDispatchProject { worker_id: "B".into(), doc_path: root.path().join("third.md") }), Err(agentranch::core::service::SubmitError::Stopped)));
+    wait_for_stop(&mut service);
+    for path in [root.path().join("ui"), root.path().join("state")] {
+        if path.exists() { assert_no_secret_in_durable_files(&path).unwrap(); }
+    }
 }
 
 #[test]

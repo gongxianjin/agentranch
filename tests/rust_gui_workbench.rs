@@ -5,6 +5,10 @@ use agentranch::{config::Mode, core::service::{ServiceOptions, Readiness, UiComm
 use eframe::egui;
 use std::{path::Path, time::{Duration, Instant}};
 
+fn workbench_viewport() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100., 1200.))
+}
+
 fn app(state: &Path, mode: Mode) -> (desktop::Workbench, egui::Context) {
     let ctx = egui::Context::default();
     let app = desktop::Workbench::new(ServiceOptions { mode, state_dir: state.into(), worker_exe: env!("CARGO_BIN_EXE_aw-cli").into(), gateway_key: None, gateway_model_token: None }, &ctx).unwrap();
@@ -23,7 +27,7 @@ fn render(app: &mut desktop::Workbench, ctx: &egui::Context) -> egui::FullOutput
     // 1100x1200 keeps the document preview inside the detail scroll's visible
     // region; at smaller heights the taller productized labels push it below
     // the fold and egui culls the etched text from the headless output.
-    let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100., 1200.))), ..Default::default() }, |ui| {
+    let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(workbench_viewport()), ..Default::default() }, |ui| {
         egui::CentralPanel::default().show(ui, |ui| app.show(ui));
     });
     // A headless renderer intentionally does not upload GPU textures.
@@ -42,6 +46,39 @@ fn rendered_text(output: &egui::FullOutput) -> String {
     for shape in &output.shapes { gather(&shape.shape, &mut text); }
     text
 }
+
+fn scroll_project_detail(app: &mut desktop::Workbench, ctx: &egui::Context, delta: f32) -> egui::FullOutput {
+    let viewport = workbench_viewport();
+    let mut output = ctx.run_ui(egui::RawInput {
+        screen_rect: Some(viewport),
+        events: vec![
+            egui::Event::PointerMoved(egui::pos2(1050., 1100.)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0., delta),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: Default::default(),
+            },
+        ],
+        ..Default::default()
+    }, |ui| { egui::CentralPanel::default().show(ui, |ui| app.show(ui)); });
+    output.textures_delta.clear();
+    output
+}
+
+fn seek_text(app: &mut desktop::Workbench, ctx: &egui::Context, needle: &str) -> egui::FullOutput {
+    // Egui clamps the first real wheel event at the scroll limit. From the
+    // bottom, bounded upward steps visit every document-card anchor without
+    // inflating the window or relying on culled shapes from a prior viewport.
+    scroll_project_detail(app, ctx, 10_000.);
+    for _ in 0..40 {
+        let output = render(app, ctx);
+        if rendered_text(&output).contains(needle) { return output; }
+        scroll_project_detail(app, ctx, -200.);
+    }
+    panic!("GUI text not reachable after bounded scrolling: {needle}");
+}
 // A default UI that still presents fixed sample tasks instead of the design-document
 // entry must fail this test, even when the underlying sample runner works.
 #[test]
@@ -53,10 +90,40 @@ fn default_workbench_starts_from_project_and_final_design_not_sample_dispatch() 
     assert!(text.contains("定稿设计文档"), "document-led entry missing: {text}");
     assert!(!text.contains("sum-native-v1"), "fixed diagnostic template must not be the primary workflow");
 }
+fn click_label(app: &mut desktop::Workbench, ctx: &egui::Context, label: &str) -> egui::FullOutput {
+    fn center(shape: &egui::epaint::Shape, label: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::epaint::Shape::Text(s) if s.galley.job.text == label => Some(s.pos + s.galley.size() / 2.),
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|shape| center(shape, label)),
+            _ => None,
+        }
+    }
+    let output = render(app, ctx);
+    let pos = output.shapes.iter().find_map(|shape| center(&shape.shape, label)).unwrap_or_else(|| panic!("missing clickable label {label}; rendered text: {}", rendered_text(&output)));
+    let viewport = workbench_viewport();
+    let mut last = output;
+    for pressed in [true, false] {
+        last = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(viewport),
+            events: vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }],
+            ..Default::default()
+        }, |ui| { egui::CentralPanel::default().show(ui, |ui| app.show(ui)); });
+        last.textures_delta.clear();
+    }
+    last
+}
+
 fn expand_project_directories(app: &mut desktop::Workbench, ctx: &egui::Context) {
-    // Settle disclosure geometry deterministically; pointer events still open it.
+    // Advanced project diagnostics is a deliberate two-step navigation; prove
+    // both user-facing pointer clicks instead of setting an internal seam.
+    // Ordinary workflow must not paint the retained engineering controls.
     ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.0);
-    render(app, ctx);
+    let ordinary = render(app, ctx);
+    let ordinary_text = rendered_text(&ordinary);
+    assert!(!ordinary_text.contains("项目与产物目录"), "ordinary workflow exposed project paths: {ordinary_text}");
+    assert!(!ordinary_text.contains("执行依赖配置"), "ordinary workflow exposed config controls: {ordinary_text}");
+    click_label(app, ctx, "高级 · 本地诊断");
+    click_label(app, ctx, "项目诊断");
     let output = render(app, ctx);
     fn directory_center(shape: &egui::epaint::Shape) -> Option<egui::Pos2> {
         match shape {
@@ -65,10 +132,11 @@ fn expand_project_directories(app: &mut desktop::Workbench, ctx: &egui::Context)
             _ => None,
         }
     }
-    let pos = output.shapes.iter().find_map(|s| directory_center(&s.shape)).expect("project directory disclosure must render");
+    let pos = output.shapes.iter().find_map(|s| directory_center(&s.shape)).expect("project directory disclosure must render in project diagnostics tab");
+    let viewport = workbench_viewport();
     for pressed in [true, false] {
         let mut output = ctx.run_ui(egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024., 768.))),
+            screen_rect: Some(viewport),
             events: vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }],
             ..Default::default()
         }, |ui| { egui::CentralPanel::default().show(ui, |ui| app.show(ui)); });
@@ -89,7 +157,8 @@ fn project_managed_paths_render_actual_core_locations_without_starting_work() {
     assert!(Path::new(&project.product_path).is_dir());
     assert_eq!(std::fs::read_dir(&project.product_path).unwrap().count(), 0);
     expand_project_directories(&mut app, &ctx);
-    let text = rendered_text(&render(&mut app, &ctx));
+    let output = seek_text(&mut app, &ctx, "项目目录：");
+    let text = rendered_text(&output);
     assert!(text.contains(&format!("项目目录：{}", project.project_path)), "actual project path missing: {text}");
     assert!(text.contains(&format!("产物目录：{}", project.product_path)), "actual product path missing: {text}");
     assert_eq!(app.snapshot().projects[0].phase, "needs_document");
@@ -119,7 +188,7 @@ fn project_legacy_paths_stay_unprepared_until_explicit_refresh_click() {
     assert!(app.snapshot().projects[0].project_path.is_empty());
     assert!(app.snapshot().projects[0].product_path.is_empty());
     expand_project_directories(&mut app, &ctx);
-    let output = render(&mut app, &ctx);
+    let output = seek_text(&mut app, &ctx, "项目目录：");
     let text = rendered_text(&output);
     assert!(!state.join("projects").exists(), "snapshot/render must not prepare directories");
     assert!(text.contains("项目目录：尚未准备目录"), "legacy project placeholder missing: {text}");
@@ -134,7 +203,7 @@ fn project_legacy_paths_stay_unprepared_until_explicit_refresh_click() {
     let pos = output.shapes.iter().find_map(|s| refresh_center(&s.shape)).expect("explicit refresh action must render");
     for pressed in [true, false] {
         let mut output = ctx.run_ui(egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024., 768.))),
+            screen_rect: Some(workbench_viewport()),
             events: vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }],
             ..Default::default()
         }, |ui| { egui::CentralPanel::default().show(ui, |ui| app.show(ui)); });
@@ -168,9 +237,11 @@ fn project_document_import_and_confirmation_render_real_version_and_blocked_spli
     let doc = snapshot.projects[0].document.as_ref().unwrap();
     assert_eq!(doc.version, 1);
     assert!(!doc.confirmed);
-    let text = rendered_text(&render(&mut app, &ctx));
+    let output = seek_text(&mut app, &ctx, "实现库存查询。");
+    let text = rendered_text(&output);
     assert!(text.contains("实现库存查询。"), "document preview missing: {text}");
-    assert!(text.contains("U1"));
+    let version_text = rendered_text(&seek_text(&mut app, &ctx, "U1"));
+    assert!(version_text.contains("U1"), "document version marker missing: {version_text}");
     assert!(text.contains(&doc.sha256));
     app.send("confirm".into(), UiCommand::ProjectConfirm { project_id: id.clone(), version: doc.version, sha256: doc.sha256.clone() });
     wait(&mut app, |s| s.projects[0].document.as_ref().is_some_and(|d| d.confirmed));
@@ -225,7 +296,7 @@ fn dropping_document_waits_for_explicit_import_and_keeps_original_text() {
     app.send("create".into(), UiCommand::ProjectCreate { name: "文件拖放".into() });
     wait(&mut app, |s| s.projects.len() == 1);
     let mut output = ctx.run_ui(egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100., 900.))),
+        screen_rect: Some(workbench_viewport()),
         dropped_files: vec![std::sync::Arc::new(NativeDrop(path))],
         ..Default::default()
     }, |ui| { egui::CentralPanel::default().show(ui, |ui| app.show(ui)); });
@@ -238,10 +309,11 @@ fn dropping_document_waits_for_explicit_import_and_keeps_original_text() {
             _ => None,
         }
     }
-    let pos = output.shapes.iter().find_map(|s| import_center(&s.shape)).expect("import action must render");
+    let output = seek_text(&mut app, &ctx, "导入设计文档");
+    let pos = output.shapes.iter().find_map(|s| import_center(&s.shape)).expect("import action must render after drop settles");
     for pressed in [true, false] {
         let mut output = ctx.run_ui(egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100., 900.))),
+            screen_rect: Some(workbench_viewport()),
             events: vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }],
             ..Default::default()
         }, |ui| { egui::CentralPanel::default().show(ui, |ui| app.show(ui)); });

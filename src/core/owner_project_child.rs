@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use super::live_output::{LiveOutput, write_live};
+use super::model_stream::read_chat_stream;
 use super::owner_project::{ARTIFACT_TOTAL_BUDGET, ModelFiles, evidence_digest, model_prompt, project_report, strip_outer_fence};
 use super::project_work::ProjectWork;
 
@@ -55,11 +57,12 @@ fn bearer_token() -> Result<String> {
     Ok(token)
 }
 
-fn call_model(endpoint: &crate::adapters::model_endpoint::ModelEndpoint, token: &str, prompt: &str) -> Result<(Value, Value)> {
+fn call_model(endpoint: &crate::adapters::model_endpoint::ModelEndpoint, token: &str, prompt: &str) -> Result<(String, Value)> {
     let client = endpoint.pinned_client()?;
     let body = json!({
         "model": endpoint.model,
         "messages": [{"role": "user", "content": prompt}],
+        "stream": true,
     });
     let request_bytes = serde_json::to_vec(&body)?;
     let started = Instant::now();
@@ -70,27 +73,21 @@ fn call_model(endpoint: &crate::adapters::model_endpoint::ModelEndpoint, token: 
         .send()
         .context("model HTTP request failed")?;
     let status = response.status().as_u16();
-    let response_bytes = response.bytes().context("model response body unreadable")?.to_vec();
-    ensure!(response_bytes.len() <= 1_048_576, "model response exceeds 1MiB bound");
-    ensure!(status == 200, "model HTTP status {status}: response prefix {}", String::from_utf8_lossy(&response_bytes[..response_bytes.len().min(512)]));
+    ensure!(status == 200, "model HTTP status {status}");
+    let mut live = |event: LiveOutput| {
+        let mut stderr = std::io::stderr().lock();
+        let _ = write_live(&mut stderr, &event);
+    };
+    let stream = read_chat_stream(response, &mut live)?;
     let elapsed = started.elapsed().as_millis() as u64;
     let evidence = json!({
         "model": endpoint.model,
         "request_sha256": evidence_digest(&request_bytes),
-        "response_sha256": evidence_digest(&response_bytes),
+        "response_sha256": stream.response_sha256,
         "elapsed_ms": elapsed,
         "status": status,
     });
-    let parsed: Value = serde_json::from_slice(&response_bytes).context("model response is not JSON")?;
-    Ok((parsed, evidence))
-}
-
-fn extract_content(response: &Value) -> Result<String> {
-    let content = response["choices"][0]["message"]["content"]
-        .as_str()
-        .context("model response has no chat content")?;
-    ensure!(content.len() <= 1_048_576, "model chat content exceeds bound");
-    Ok(content.to_owned())
+    Ok((stream.content, evidence))
 }
 
 pub fn run_in(work_dir: &Path) -> Result<()> {
@@ -98,8 +95,7 @@ pub fn run_in(work_dir: &Path) -> Result<()> {
     let endpoint = load_endpoint()?;
     let token = bearer_token()?;
     let prompt = model_prompt(&binding.work)?;
-    let (response, evidence) = call_model(&endpoint, &token, &prompt)?;
-    let content = extract_content(&response)?;
+    let (content, evidence) = call_model(&endpoint, &token, &prompt)?;
     let cleaned = strip_outer_fence(&content)?;
     let files = ModelFiles::parse(cleaned, ARTIFACT_TOTAL_BUDGET)?;
     let workspace = binding.work_dir.join("files");

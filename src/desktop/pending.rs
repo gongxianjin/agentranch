@@ -11,6 +11,9 @@ impl Pending {
     pub fn contains(&self, action: &str) -> bool {
         self.requests.values().any(|pending| pending == action)
     }
+    pub fn has_project_work_submit(&self) -> bool {
+        self.requests.values().any(|pending| pending.starts_with("work-submit:"))
+    }
     pub fn complete(&mut self, request_id: u64) -> Option<String> {
         self.requests.remove(&request_id)
     }

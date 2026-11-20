@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, time::{Instant, SystemTime, UNIX_EPOCH}};
 
-use agentranch::core::service::{AppSnapshot, ProjectSnapshot, UiCommand};
+use agentranch::core::service::{AppSnapshot, LiveOutputEvent, ProjectSnapshot, RunView, ServiceError, UiCommand};
+use super::project_activity::ProjectActivity;
 use eframe::egui::{self, RichText};
-use super::{action::{action, action_primary, action_step}, pending::Pending, theme};
+use super::{action::{action, action_step}, pending::Pending, theme, worker_submit::WorkerSubmitGate};
 
 // Step indexes: the current step's main control renders as the primary
 // (brand-filled) button; the same control on non-current steps stays an
@@ -108,6 +109,18 @@ fn rail_step_name(step: usize) -> &'static str {
     ["新建项目", "定稿设计", "任务审核", "开发", "测试与返修", "人工验收"][step]
 }
 
+/// List-only projection: a published result wins over session-local activity.
+fn project_list_status(work_run: Option<&RunView>, activity: Option<&ProjectActivity>) -> Option<String> {
+    match work_run.map(|view| view.run.status.as_str()) {
+        Some("done") => Some("任务：已完成".into()),
+        Some("failed") => Some("任务：失败".into()),
+        Some("cancelled") => Some("任务：已取消".into()),
+        Some("unknown") => Some("任务：结果未知，名额保留".into()),
+        _ => activity.map(|output| format!("执行：{}", output.status_label()))
+            .or_else(|| work_run.map(|_| "任务：执行中".into())),
+    }
+}
+
 /// Editable input and selection only. All document/review/execution facts come from core.
 pub struct Projects {
     pub selected: Option<String>,
@@ -117,17 +130,108 @@ pub struct Projects {
     review_reasons: BTreeMap<String, String>,
     repair_reason: String,
     receipts_view: Vec<(String, String)>,
+    output: Option<ProjectActivity>,
+    reveal_output: bool,
     #[cfg(windows)]
     picker: Option<std::sync::mpsc::Receiver<(String, Option<PathBuf>)>>,
 }
 impl Default for Projects {
     fn default() -> Self {
-        Self { selected: None, name: "新项目".into(), path: String::new(), config_path: String::new(), review_reasons: BTreeMap::new(), repair_reason: String::new(), receipts_view: Vec::new(), #[cfg(windows)] picker: None }
+        Self { selected: None, name: "新项目".into(), path: String::new(), config_path: String::new(), review_reasons: BTreeMap::new(), repair_reason: String::new(), receipts_view: Vec::new(), output: None, reveal_output: false, #[cfg(windows)] picker: None }
     }
 }
 
 impl Projects {
-    pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot, pending: &Pending, receipts: &[(String, String)]) -> Vec<(String, UiCommand)> {
+    pub fn begin_live(&mut self, request_id: u64, project_id: String) {
+        self.selected = Some(project_id.clone());
+        self.reveal_output = true;
+        self.output = Some(ProjectActivity::new(request_id, project_id, Instant::now(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()));
+    }
+    pub fn apply_live(&mut self, event: LiveOutputEvent) {
+        if let Some(output) = &mut self.output { output.apply(event); }
+    }
+    pub fn finish_live(&mut self, request_id: u64, result: &Result<serde_json::Value, ServiceError>) {
+        if let Some(output) = &mut self.output { output.finish(request_id, result, Instant::now()); }
+    }
+    fn render_live(&mut self, ui: &mut egui::Ui, project_id: &str, work_run: Option<&RunView>) {
+        if let Some(output) = self.output.as_mut().filter(|output| output.project_id == project_id) {
+            if let Some(view) = work_run {
+                output.render_with_published_status(ui, Instant::now(), Some(view.run.status.as_str()));
+            } else {
+                output.render(ui, Instant::now());
+            }
+        } else {
+            Self::render_output_empty(ui, Some(work_run.is_some()));
+        }
+    }
+    fn render_output_empty(ui: &mut egui::Ui, has_work_run: Option<bool>) {
+        theme::card(ui, |ui| {
+            ui.strong(RichText::new("模型实时输出（SSE）").color(theme::BRAND).size(19.));
+            match has_work_run {
+                None => { ui.label("新建项目并确认设计文档后，点击“提交项目”；模型正文会在这里逐段显示。"); }
+                Some(false) => { ui.label("尚未提交项目。确认设计文档后点击“提交项目”，模型正文会在这里逐段显示。"); }
+                Some(true) => {
+                    ui.label("本次会话没有该任务的实时正文；不会回放历史输出。");
+                    ui.label("请查看下方“结果核对”和“操作回执”；不要重复提交当前任务。");
+                }
+            }
+            ui.small("仅显示当前会话收到的实际正文，不伪造模型思考；关闭工作台后不会恢复该正文。");
+        });
+    }
+    fn render_result_summary(ui: &mut egui::Ui, work_run: Option<&RunView>) {
+        ui.strong("结果核对");
+        let Some(run) = work_run else {
+            ui.label("最终任务结果：尚未返回");
+            ui.label("准入状态：尚未形成终态");
+            ui.label("产物目录：尚未物化");
+            ui.label("回执提示：等待最终任务回执");
+            return;
+        };
+        let status = run.run.status.as_str();
+        let artifact_dir = run.run.detail["artifact_dir"].as_str().filter(|path| !path.is_empty());
+        match status {
+            "done" => {
+                ui.label("最终任务结果：完成");
+                let admitted = run.run.detail["owner_admission"] == "admitted"
+                    && run.run.detail["exit_proof"].is_object()
+                    && artifact_dir.is_some();
+                if admitted {
+                    ui.label("准入状态：已准入");
+                    ui.label(format!("产物目录：{}", artifact_dir.expect("checked above")));
+                    ui.label("回执提示：核对产物目录和操作回执");
+                } else {
+                    ui.label("准入状态：未准入");
+                    ui.label(format!("产物目录：{}", artifact_dir.unwrap_or("尚未物化")));
+                    ui.label("回执提示：已返回完成状态但证据不完整，请查看操作回执");
+                }
+            }
+            "failed" => {
+                ui.label("最终任务结果：失败");
+                ui.label("准入状态：未准入");
+                ui.label(format!("产物目录：{}", artifact_dir.unwrap_or("尚未物化")));
+                ui.label("回执提示：查看操作回执；不会自动重跑");
+            }
+            "cancelled" => {
+                ui.label("最终任务结果：已取消");
+                ui.label("准入状态：未准入");
+                ui.label(format!("产物目录：{}", artifact_dir.unwrap_or("尚未物化")));
+                ui.label("回执提示：以最终取消回执为准");
+            }
+            "unknown" => {
+                ui.label("最终任务结果：结果未知");
+                ui.label("准入状态：未准入");
+                ui.label("产物目录：尚未物化");
+                ui.label("回执提示：名额保留；不要手动释放或自动重跑");
+            }
+            _ => {
+                ui.label("最终任务结果：尚未返回");
+                ui.label("准入状态：尚未形成终态");
+                ui.label("产物目录：尚未物化");
+                ui.label("回执提示：等待最终任务回执");
+            }
+        }
+    }
+    pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &AppSnapshot, pending: &Pending, receipts: &[(String, String)], diagnostics: bool) -> Vec<(String, UiCommand)> {
         let mut commands = Vec::new();
         self.receipts_view = receipts.to_vec();
         #[cfg(windows)]
@@ -144,6 +248,12 @@ impl Projects {
         if self.selected.as_ref().is_none_or(|id| !snapshot.projects.iter().any(|p| &p.id == id)) {
             self.selected = snapshot.projects.first().map(|p| p.id.clone());
         }
+        // File drops are path-only input. Route them to the selected project's
+        // editable import field before layout/culling decides which step body
+        // is painted; never inspect bytes or dispatch an import implicitly.
+        if let Some(path) = ui.ctx().input(|input| input.raw.dropped_files.first().map(|file| file.path().to_path_buf())) {
+            if self.selected.is_some() { self.path = path.display().to_string(); }
+        }
         egui::Panel::left("project-list").resizable(true).default_size(255.).min_size(200.).show(ui, |ui| {
             ui.heading("项目");
             ui.label("项目名称");
@@ -152,9 +262,28 @@ impl Projects {
             ui.separator();
             egui::ScrollArea::vertical().id_salt("project-list-scroll").show(ui, |ui| {
                 for project in &snapshot.projects {
-                    let (_current, done) = phase_rail(&project.phase);
-                    let done_count = done.iter().filter(|d| **d).count();
-                    if ui.selectable_label(self.selected.as_deref() == Some(&project.id), format!("{}\n{}\n已完成 {done_count}/6 步", project.name, phase_label(&project.phase))).clicked() {
+                    let work_run = snapshot.runs.iter().find(|view| {
+                        view.run.template == "project-work-v1"
+                            && view.run.detail["project_work"]["project_id"] == project.id
+                    });
+                    let activity = self.output.as_ref().filter(|output| output.project_id == project.id);
+                    let status = project_list_status(work_run, activity)
+                        .map(|status| format!("\n{status}")).unwrap_or_default();
+                    let (phase, done_count, total) = if diagnostics {
+                        let (_, done) = phase_rail(&project.phase);
+                        (phase_label(&project.phase), done.iter().filter(|d| **d).count(), 6)
+                    } else {
+                        let confirmed = project.document.as_ref().is_some_and(|document| document.confirmed);
+                        let phase = match project.document.as_ref() {
+                            None => "等待导入设计文档",
+                            Some(document) if !document.confirmed => "文档待确认",
+                            Some(_) => "文档已确认",
+                        };
+                        let done_count = 1 + usize::from(confirmed)
+                            + usize::from(work_run.is_some_and(|view| view.run.status == "done"));
+                        (phase, done_count, 3)
+                    };
+                    if ui.selectable_label(self.selected.as_deref() == Some(&project.id), format!("{}\n{phase}\n已完成 {done_count}/{total} 步{status}", project.name)).clicked() {
                         self.selected = Some(project.id.clone());
                         self.path.clear();
                         self.repair_reason.clear();
@@ -164,11 +293,16 @@ impl Projects {
             });
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("project-detail-scroll").show(ui, |ui| {
+            let mut detail_scroll = egui::ScrollArea::vertical().id_salt("project-detail-scroll");
+            if std::mem::take(&mut self.reveal_output) {
+                detail_scroll = detail_scroll.vertical_scroll_offset(0.);
+            }
+            detail_scroll.show(ui, |ui| {
                 if let Some(project) = snapshot.projects.iter().find(|p| self.selected.as_deref() == Some(&p.id)) {
-                    self.detail(ui, project, pending, &mut commands);
+                    self.detail(ui, project, snapshot, pending, &mut commands, diagnostics);
                 } else {
                     self.welcome(ui);
+                    self.render_receipts(ui);
                 }
                 for error in &snapshot.errors {
                     ui.separator();
@@ -194,12 +328,101 @@ impl Projects {
             ui.label(step_intro(0));
             ui.label(RichText::new("现在做：在左侧“项目名称”填入名字，点“新建项目”").color(theme::BRAND));
         });
+        Self::render_output_empty(ui, None);
     }
+    fn render_receipts(&self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("操作回执")
+            .default_open(true)
+            .id_salt("project-receipts")
+            .show(ui, |ui| {
+                ui.small("核心接受请求不等于外部执行完成；以项目阶段、公开输出和独立测试结果为准。");
+                for (title, detail) in &self.receipts_view {
+                    egui::CollapsingHeader::new(title).default_open(true).show(ui, |ui| { ui.add(egui::Label::new(RichText::new(detail).monospace()).wrap()); });
+                }
+            });
+    }
+
+    fn detail_novice(&mut self, ui: &mut egui::Ui, project: &ProjectSnapshot, snapshot: &AppSnapshot, pending: &Pending, commands: &mut Vec<(String, UiCommand)>) {
+        let id = &project.id;
+        ui.heading(&project.name);
+        ui.label(RichText::new("普通项目路径：确认设计文档后，直接提交到当前 Worker。").color(theme::BRAND));
+        let document_ready = project.document.as_ref().is_some_and(|document| document.confirmed);
+        let work_run = snapshot.runs.iter().find(|run| {
+            run.run.template == "project-work-v1"
+                && run.run.detail["project_work"]["project_id"] == project.id
+        });
+        let active_work = work_run.is_some_and(|run| !matches!(run.run.status.as_str(), "done" | "failed" | "cancelled"));
+        let worker_gate = WorkerSubmitGate::from_snapshot(snapshot, pending);
+        let any_live_task = self.output.as_ref().is_some_and(|output| {
+            output.task_status.as_deref().is_none_or(|status| status == "unknown")
+        });
+        let can_submit = worker_gate == WorkerSubmitGate::Ready
+            && document_ready
+            && work_run.is_none()
+            && !any_live_task;
+
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.strong("进度");
+            ui.horizontal_wrapped(|ui| {
+                let steps = [("①", "新建项目", true), ("②", "定稿设计", document_ready), ("③", "提交项目", work_run.is_some_and(|run| run.run.status == "done"))];
+                for (index, (marker, label, done)) in steps.iter().enumerate() {
+                    if index > 0 { ui.label(RichText::new("→").weak()); }
+                    let shown = if *done { "✓" } else if (index == 1 && !document_ready) || (index == 2 && document_ready && work_run.is_none()) { "▶" } else { marker };
+                    ui.label(RichText::new(format!("{shown} {label}")));
+                }
+            });
+            ui.label(RichText::new(if !document_ready {
+                "现在做：导入设计文档，核对内容后确认上传版本"
+            } else if any_live_task || active_work {
+                "现在做：已有项目任务执行中或结果未知；查看项目列表的执行状态，不会自动重跑"
+            } else if work_run.is_some() {
+                "现在做：查看结果核对和操作回执；如需再次执行，请新建项目"
+            } else if worker_gate != WorkerSubmitGate::Ready {
+                worker_gate.blocking_guidance()
+            } else {
+                "现在做：确认 Worker 状态后点“提交项目”"
+            }).color(theme::BRAND));
+        });
+
+        self.render_live(ui, id, work_run);
+
+        theme::card(ui, |ui| {
+            ui.set_min_width(ui.available_width() * 0.95);
+            self.step_body(ui, 1, project, pending, commands);
+        });
+
+        theme::card(ui, |ui| {
+            ui.set_min_width(ui.available_width() * 0.95);
+            ui.strong(RichText::new("项目提交").color(theme::BRAND).size(19.));
+            Self::render_result_summary(ui, work_run);
+            if work_run.is_none() && can_submit {
+                ui.label("Worker 已连接，可提交项目。使用已确认的上传版本提交到当前 Worker。");
+            } else if active_work || any_live_task {
+                ui.label("已有项目任务执行中或结果未知；请查看执行活动，当前不能再次提交。");
+            } else if work_run.is_some() {
+                ui.label("本项目已有任务结果；如需再次执行，请新建项目。");
+            } else if worker_gate != WorkerSubmitGate::Ready {
+                ui.label(worker_gate.blocking_guidance());
+            } else {
+                ui.label("完成 Worker 准备并确认上传版本后，才能提交项目。");
+            }
+            action_step(ui, pending, commands, "提交项目", can_submit, true, &format!("project:{id}:work-submit"), format!("work-submit:{id}"), UiCommand::ProjectWorkSubmit { project_id: id.clone() });
+            ui.small("提交使用系统保存的确认文档；不会要求 Worker、Gateway 或原文件路径。");
+        });
+        self.render_receipts(ui);
+    }
+
     /// The six wizard step cards: completed steps collapse into one-line
     /// summaries, the current step expands into the primary card with its main
     /// button highlighted, later steps stay visible but dimmed with their
-    /// (gated) controls still registered every frame.
-    fn detail(&mut self, ui: &mut egui::Ui, project: &ProjectSnapshot, pending: &Pending, commands: &mut Vec<(String, UiCommand)>) {
+    /// (gated) controls still registered every frame. This is retained for
+    /// 高级 · 本地诊断 only.
+    fn detail(&mut self, ui: &mut egui::Ui, project: &ProjectSnapshot, snapshot: &AppSnapshot, pending: &Pending, commands: &mut Vec<(String, UiCommand)>, diagnostics: bool) {
+        if !diagnostics {
+            self.detail_novice(ui, project, snapshot, pending, commands);
+            return;
+        }
         let id = &project.id;
         ui.heading(&project.name);
         ui.label(RichText::new(format!("当前阶段：{}", phase_label(&project.phase))).color(theme::BRAND));
@@ -237,30 +460,61 @@ impl Projects {
         // Advanced disclosures sit directly under the rail (above the step
         // column): engineering detail the novice never needs, always reachable
         // without scrolling regardless of the current step's card height.
-        egui::CollapsingHeader::new("项目与产物目录")
-            .id_salt(("project-directories", id))
-            .show(ui, |ui| {
-                ui.add(egui::Label::new(format!("项目目录：{}", if project.project_path.is_empty() { "尚未准备目录" } else { &project.project_path })).wrap());
-                ui.add(egui::Label::new(format!("产物目录：{}", if project.product_path.is_empty() { "尚未准备目录" } else { &project.product_path })).wrap());
-                ui.small("目录存在不代表已生成产物或开发完成。");
-                ui.small("刷新项目会由后台准备或校验受管目录；旧项目首次刷新可能创建目录，不启动开发。");
-                action(ui, pending, commands, "刷新项目", true, &format!("project:{id}:refresh"), format!("refresh:{id}"), UiCommand::ProjectRefresh { project_id: id.clone() });
+        if diagnostics {
+            egui::CollapsingHeader::new("项目与产物目录")
+                .id_salt(("project-directories", id))
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(format!("项目目录：{}", if project.project_path.is_empty() { "尚未准备目录" } else { &project.project_path })).wrap());
+                    ui.add(egui::Label::new(format!("产物目录：{}", if project.product_path.is_empty() { "尚未准备目录" } else { &project.product_path })).wrap());
+                    ui.small("目录存在不代表已生成产物或开发完成。");
+                    ui.small("刷新项目会由后台准备或校验受管目录；旧项目首次刷新可能创建目录，不启动开发。");
+                    action(ui, pending, commands, "刷新项目", true, &format!("project:{id}:refresh"), format!("refresh:{id}"), UiCommand::ProjectRefresh { project_id: id.clone() });
+                });
+            egui::CollapsingHeader::new("执行依赖配置")
+                .id_salt("project-config")
+                .show(ui, |ui| {
+                    ui.label("配置文件路径（由后台读取，不自动启动任务）");
+                    ui.text_edit_singleline(&mut self.config_path);
+                    action(ui, pending, commands, "加载执行配置", !self.config_path.trim().is_empty(), "project-configure", "project-configure".into(), UiCommand::ProjectConfigure { config_path: PathBuf::from(self.config_path.trim()) });
+                });
+        }
+        if !diagnostics {
+            let work_run = snapshot.runs.iter().find(|run| {
+                run.run.template == "project-work-v1"
+                    && run.run.detail["project_work"]["project_id"] == project.id
             });
-        egui::CollapsingHeader::new("执行依赖配置")
-            .id_salt("project-config")
-            .show(ui, |ui| {
-                ui.label("配置文件路径（由后台读取，不自动启动任务）");
-                ui.text_edit_singleline(&mut self.config_path);
-                action(ui, pending, commands, "加载执行配置", !self.config_path.trim().is_empty(), "project-configure", "project-configure".into(), UiCommand::ProjectConfigure { config_path: PathBuf::from(self.config_path.trim()) });
-            });
-        egui::CollapsingHeader::new("操作回执")
-            .id_salt("project-receipts")
-            .show(ui, |ui| {
-                ui.small("核心接受请求不等于外部执行完成；以项目阶段、公开输出和独立测试结果为准。");
-                for (title, detail) in &self.receipts_view {
-                    egui::CollapsingHeader::new(title).show(ui, |ui| { ui.add(egui::Label::new(RichText::new(detail).monospace()).wrap()); });
+            let active_work = work_run.is_some_and(|run| !matches!(run.run.status.as_str(), "done" | "failed" | "cancelled"));
+            let can_submit = snapshot.gateway.as_ref().is_some_and(|gateway| gateway.preflight_passed)
+                && project.document.as_ref().is_some_and(|document| document.confirmed)
+                && !active_work;
+            ui.add_space(6.);
+            theme::card(ui, |ui| {
+                ui.strong(RichText::new("项目提交").color(theme::BRAND).size(19.));
+                if let Some(run) = work_run {
+                    match run.run.status.as_str() {
+                        "done"
+                            if run.run.detail["owner_admission"] == "admitted"
+                                && run.run.detail["exit_proof"].is_object()
+                                && run.run.detail["artifact_dir"].as_str().is_some_and(|path| !path.is_empty()) => {
+                            ui.label("已收到并准入远端结果。");
+                            if let Some(path) = run.run.detail["artifact_dir"].as_str() {
+                                ui.label("已物化项目产物，可在本机目录查看。");
+                                ui.small(format!("产物目录：{path}"));
+                            }
+                        }
+                        "unknown" => { ui.label("远端任务结果未知；尚无可准入终态，系统保留名额且不会自动重跑。"); }
+                        _ => { ui.label("远端任务执行中；尚未收到可准入的终态证据。"); }
+                    }
+                } else if can_submit {
+                    ui.label("Worker 已连接，可提交项目。使用已确认的上传版本提交到当前 Worker。");
+                } else {
+                    ui.label("完成 Worker 准备并确认上传版本后，才能提交项目。");
                 }
+                action_step(ui, pending, commands, "提交项目", can_submit, true, &format!("project:{id}:work-submit"), format!("work-submit:{id}"), UiCommand::ProjectWorkSubmit { project_id: id.clone() });
+                ui.small("提交使用系统保存的确认文档；不会要求 Worker、Gateway 或原文件路径。");
             });
+        }
+        self.render_receipts(ui);
         // Step cards.
         ui.add_space(4.);
         for step in 0..6 {
@@ -309,8 +563,6 @@ impl Projects {
                 // Document import + confirmation of the uploaded version.
                 ui.strong("定稿设计文档");
                 ui.label("UTF-8 .md / .txt，原文件不超过 256 KiB。输入文件路径，或把文件拖到此窗口。");
-                let dropped = ui.ctx().input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
-                if let Some(path) = dropped { self.path = path.display().to_string(); }
                 ui.text_edit_singleline(&mut self.path);
                 #[cfg(windows)]
                 if ui.add_enabled(self.picker.is_none(), egui::Button::new("选择设计文件…")).clicked() {
@@ -328,7 +580,7 @@ impl Projects {
                         ui.add(egui::Label::new(&document.text).wrap());
                     });
                     action_step(ui, pending, commands, "确认此上传版本", project.can_confirm, primary, &format!("project:{id}:confirm:{}", document.version), format!("confirm:{id}:{}", document.version), UiCommand::ProjectConfirm { project_id: id.clone(), version: document.version, sha256: document.sha256.clone() });
-                } else { ui.label("尚未导入文档，不能拆分或开始开发。"); }
+                } else { ui.label("尚未导入文档，请先导入并确认上传版本。"); }
             }
             2 => {
                 ui.strong("逐项审核任务");

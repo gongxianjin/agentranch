@@ -513,6 +513,16 @@ impl Store {
         for node in capable{let mut m=Envelope{schema:PROTOCOL.into(),message_id:Uuid::new_v4().to_string(),deployment:self.deployment.clone(),from:"A".into(),to:node.id.clone(),run_id:run.id.clone(),attempt:run.attempt,epoch:run.epoch.clone(),kind:"start".into(),sent_at:now,expires_at:now.saturating_add(300),payload:json!({"template":run.template,"deadline":run.deadline,"project_work":work}),mac:String::new()};m.sign(&hex::decode(&node.key_hex)?)?;m.verify(&hex::decode(&node.key_hex)?,&self.deployment,&node.id,now).context("document execution exceeds native signed frame limit; import is retained but no task is queued")?;}
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;tx.execute("INSERT INTO runs(id,body,status,attempt) VALUES(?1,?2,?3,?4)",params![run.id,serde_json::to_string(&run)?,run.status,run.attempt])?;tx.commit()?;Ok(run)
     }
+    /// Remove a freshly queued run that could not be assigned. No assignment or
+    /// execution evidence exists at this point, so retaining it would create a
+    /// queued run that the real-mode service cannot recover or pump.
+    pub fn discard_unassigned_queued_run(&mut self,id:&str)->Result<()> {
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted=tx.execute("DELETE FROM runs WHERE id=?1 AND status='queued' AND NOT EXISTS (SELECT 1 FROM assignments WHERE run=?1)",[id])?;
+        ensure!(deleted==1,"queued run was assigned or is no longer present");
+        tx.commit()?;
+        Ok(())
+    }
     pub fn run(&self,id:&str)->Result<Run>{read_run(&self.db,id)}
     /// Annotate a run's detail with a manager-local observation (e.g. the
     /// materialized artifact directory). Detail-only: status, attempt and

@@ -30,7 +30,7 @@ impl LocalReason {
             while !cancelled.load(Ordering::Acquire) {
                 let Some(mut stream) = platform::accept(&mut listener, &address, &cancelled)? else { break };
                 if cancelled.load(Ordering::Acquire) { break; }
-                let request = read_frame(&mut stream, &cancelled)?;
+                let Some(request) = read_frame(&mut stream, &cancelled)? else { break };
                 let response = respond(&state, &request)?;
                 writeln!(stream, "{response}")?;
                 platform::complete(stream, &cancelled)?;
@@ -66,21 +66,43 @@ impl Drop for LocalReason {
         self.thread.take().unwrap().join().expect("local fixture thread").expect("local fixture IPC");
     }
 }
-fn read_frame(stream: &mut impl Read, stop: &AtomicBool) -> anyhow::Result<Value> {
+fn read_frame(stream: &mut impl Read, stop: &AtomicBool) -> anyhow::Result<Option<Value>> {
     let end = Instant::now() + Duration::from_secs(5);
     let mut raw = Vec::new();
     loop {
-        anyhow::ensure!(Instant::now() < end && !stop.load(Ordering::Acquire), "fixture read deadline");
+        if stop.load(Ordering::Acquire) { return Ok(None); }
+        anyhow::ensure!(Instant::now() < end, "fixture read deadline");
         let mut byte = [0];
         match stream.read(&mut byte) {
             Ok(0) => anyhow::bail!("fixture EOF"),
-            Ok(_) if byte[0] == b'\n' => return Ok(serde_json::from_slice(&raw)?),
+            Ok(_) if byte[0] == b'\n' => return Ok(Some(serde_json::from_slice(&raw)?)),
             Ok(_) => { raw.push(byte[0]); anyhow::ensure!(raw.len() <= 65536, "fixture frame bound"); }
             Err(e) if platform::would_block(&e) => std::thread::sleep(Duration::from_millis(1)),
             Err(e) => return Err(e.into()),
         }
     }
 }
+#[cfg(test)]
+mod lifecycle_reason_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn cancellation_is_a_clean_read_outcome() {
+        let stop = AtomicBool::new(true);
+        let result = read_frame(&mut Cursor::new(Vec::<u8>::new()), &stop);
+        assert!(matches!(result, Ok(None)), "cancelled fixture read must stop cleanly: {result:?}");
+    }
+
+    #[test]
+    fn eof_remains_a_fixture_ipc_error() {
+        let stop = AtomicBool::new(false);
+        let result = read_frame(&mut Cursor::new(Vec::<u8>::new()), &stop);
+        let error = result.expect_err("EOF must remain an error");
+        assert!(error.to_string().contains("fixture EOF"));
+    }
+}
+
 fn respond(state: &Mutex<Bus>, request: &Value) -> anyhow::Result<Value> {
     let mut bus = state.lock().unwrap();
     if request["op"] == "inbox" && bus.fail_inbox {

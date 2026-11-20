@@ -48,10 +48,17 @@ impl SshManager {
     /// the pinned worker: same assignment, signature and exchange flow as
     /// sum-v1, but the start payload carries the project_work JSON.
     pub fn dispatch_project_with_transport<T:WorkerTransport>(&mut self,actor:&Actor,work:&ProjectWork,transport:&mut T,now:u64)->Result<GatewayResult> {
+        self.dispatch_project_stream(actor,work,transport,now,&mut |_| {})
+    }
+    pub fn dispatch_project_stream<T:WorkerTransport>(&mut self,actor:&Actor,work:&ProjectWork,transport:&mut T,now:u64,emit:&mut dyn FnMut(super::live_output::LiveOutput))->Result<GatewayResult> {
         let run=self.store.dispatch_project(actor,work,now)?;
-        self.store.assign_run_with_worker_artifact(now,&run.id,&self.config.worker_id,self.config.artifact_sha256.clone())?.context("configured worker has no available slot")?;
+        let assignment=self.store.assign_run_with_worker_artifact(now,&run.id,&self.config.worker_id,self.config.artifact_sha256.clone())?;
+        let Some(_) = assignment else {
+            self.store.discard_unassigned_queued_run(&run.id)?;
+            anyhow::bail!("configured worker has no available slot");
+        };
         let request=GatewayRequest::from_store(&self.store,&self.config,&run.id)?;
-        run_once(&self.config,&request,&mut self.store,transport,now)
+        super::ssh_gateway::run_once_stream(&self.config,&request,&mut self.store,transport,now,emit)
     }
 
     pub fn dispatch(&mut self,actor:&Actor,now:u64)->Result<GatewayResult> {

@@ -373,6 +373,69 @@ class ParamikoGatewayExchangeTests(unittest.TestCase):
         self.assertFalse(channel.stderr)
         self.assertEqual(channel.status_reads, 1)
 
+    def test_live_stderr_line_is_forwarded_before_next_recv_and_diagnostics_are_retained(self):
+        helper = self.helper
+        live = b'AO-LIVE {"kind":"delta","text":"first"}\n'
+        forwarded = bytearray()
+        testcase = self
+        class GatedChannel(LocalChannel):
+            def recv_stderr(self, size):
+                if len(self.stderr) == 1:
+                    testcase.assertIn(live, bytes(forwarded), "first line must flush before next recv")
+                return super().recv_stderr(size)
+        channel = GatedChannel(
+            [LAUNCH_BYTES + TERMINAL_BYTES],
+            [live[:13], live[13:], b"ordinary diagnostic\n"],
+            early_status=True,
+        )
+        original_write = helper._write
+        def observe(stream, value):
+            forwarded.extend(value)
+            original_write(stream, value)
+        with mock.patch.object(helper, "_write", side_effect=observe):
+            result = self.run_gateway(channel)
+        self.assertEqual(result.code, 0)
+        self.assertIn(live, bytes(forwarded))
+        self.assertIn(b"ordinary diagnostic\n", result.stderr)
+
+    def test_live_text_does_not_bypass_existing_known_secret_redaction(self):
+        live = b'AO-LIVE {"kind":"delta","text":"' + SYNTHETIC_KEY + b'"}\n'
+        result = self.run_gateway(LocalChannel([TERMINAL_BYTES], [live[:21], live[21:]]))
+        self.assertEqual(result.code, 0)
+        self.assertNotIn(SYNTHETIC_KEY, result.stderr)
+        self.assertIn(b'[REDACTED]', result.stderr)
+
+    def test_malformed_live_schema_remains_in_diagnostic_output(self):
+        live = b'AO-LIVE {"kind":"delta","text":"x","extra":1}\n'
+        helper = self.helper
+        err = helper.BoundedBuffer(helper.MAX_STDERR)
+        pending = bytearray()
+        forwarded = bytearray()
+        with mock.patch.object(helper, "_write", side_effect=lambda _stream, value: forwarded.extend(value)):
+            helper._forward_stderr_chunk(live, pending, err, [SYNTHETIC_KEY])
+        self.assertEqual(bytes(forwarded), b"")
+        self.assertEqual(err.value(), live)
+
+    def test_many_live_lines_do_not_consume_diagnostic_bound(self):
+        helper = self.helper
+        self.metadata["timeout_secs"] = 300
+        live = b'AO-LIVE {"kind":"delta","text":"x"}\n'
+        channel = LocalChannel(
+            [LAUNCH_BYTES + TERMINAL_BYTES],
+            [live] * (helper.MAX_STDERR // len(live) + 100) + [b"ordinary diagnostic\\n"],
+            early_status=True,
+        )
+        forwarded = bytearray()
+        original_write = helper._write
+        def observe(stream, value):
+            forwarded.extend(value)
+            original_write(stream, value)
+        with mock.patch.object(helper, "_write", side_effect=observe):
+            result = self.run_gateway(channel)
+        self.assertEqual(result.code, 0)
+        self.assertIn(b"ordinary diagnostic\\n", result.stderr)
+        self.assertGreaterEqual(bytes(forwarded).count(live), 1)
+
     def test_stdout_bound_retains_prefix_drains_both_streams_and_fails(self):
         channel = LocalChannel([b"1234", b"56789", b"tail"], [b"diagnostic"])
         with mock.patch.object(self.helper, "MAX_STDOUT", 8):

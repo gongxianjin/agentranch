@@ -59,6 +59,13 @@ fn execute()->Result<()> {
  let args:Vec<String>=std::env::args().skip(1).collect();
  match args.first().map(String::as_str){
   Some("--identity") if args.len()==1=>{println!("{}",json!({"binary":"aw-cli","package":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION")}));Ok(())}
+  Some("--capabilities") if args.len()==1=>{
+   let linux=cfg!(target_os="linux");
+   println!("{}",json!({"schema":"worker-capabilities/1","binary":"aw-cli","platform":std::env::consts::OS,
+    "owner_exec_templates":if linux{vec!["sum-v1","project-work-v1"]}else{vec![]},
+    "model_token_frame":if linux{Some("u32be-utf8/1")}else{None},
+    "live_output":if linux{Some("AO-LIVE/1")}else{None}}));Ok(())
+  }
 
   Some("owner-exec")=>owner_exec(&args),
   Some("owner-child")=>owner_child(&args),
@@ -78,7 +85,7 @@ fn execute()->Result<()> {
    else{agentranch::core::runtime::runner(&path,&cfg,once)}
   },
 
-  Some("--help")|Some("help")=>{println!("aw-cli --identity\naw-cli check --config FILE\naw-cli mcp --config FILE\naw-cli local-check --state-dir DIR\naw-cli runner --config FILE [--once | --stop-on-stdin]\naw-cli controller --config FILE [--once]\naw-cli owner-exec --config FILE\naw-cli owner-child sum-v1 SESSION\naw-cli ssh-gateway --config FILE --request FILE --evidence-dir DIR --helper FILE --key-stdin\n--key-stdin: read one short-lived SSH private key from stdin; no private-key file is accepted\n--stop-on-stdin: first stdin frame must be stop LF or stop CRLF; stops local supervision only\ncontroller/runner real service: not ready until explicit adapter configuration");Ok(())},
+  Some("--help")|Some("help")=>{println!("aw-cli --identity\naw-cli --capabilities\naw-cli check --config FILE\naw-cli mcp --config FILE\naw-cli local-check --state-dir DIR\naw-cli runner --config FILE [--once | --stop-on-stdin]\naw-cli controller --config FILE [--once]\naw-cli owner-exec --config FILE\naw-cli owner-child sum-v1 SESSION\naw-cli ssh-gateway --config FILE --request FILE --evidence-dir DIR --helper FILE --key-stdin\n--key-stdin: read one short-lived SSH private key from stdin; no private-key file is accepted\n--stop-on-stdin: first stdin frame must be stop LF or stop CRLF; stops local supervision only\ncontroller/runner real service: not ready until explicit adapter configuration");Ok(())},
   _=>anyhow::bail!("usage: aw-cli <check|mcp|local-check|controller|runner> (see --help)"),
  }
 }

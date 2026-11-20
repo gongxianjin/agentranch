@@ -30,6 +30,11 @@ fn recovered_pending_exit(state: &Path) -> (desktop::Workbench, egui::Context, S
     let mut app = desktop::Workbench::new(ServiceOptions { mode: Mode::Real, state_dir: state.into(), worker_exe: env!("CARGO_BIN_EXE_aw-cli").into(), gateway_key: None, gateway_model_token: None }, &ctx).unwrap();
     ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.0);
     wait(&mut app, |s| s.projects.len() == 1);
+    // Review controls belong to the advanced local-diagnostics project wizard.
+    // Reach them through the same visible navigation as a user; do not bypass
+    // the product entry point by toggling private Workbench flags.
+    click_text(&mut app, &ctx, "高级 · 本地诊断");
+    click_text(&mut app, &ctx, "项目诊断");
     (app, ctx, id)
 }
 fn wait(app: &mut desktop::Workbench, predicate: impl Fn(&agentranch::core::service::AppSnapshot) -> bool) {
@@ -46,6 +51,17 @@ fn wait(app: &mut desktop::Workbench, predicate: impl Fn(&agentranch::core::serv
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+fn click_text(app: &mut desktop::Workbench, ctx: &egui::Context, label: &str) {
+    for _ in 0..2 { frame(app, ctx, vec![]); }
+    let output = frame(app, ctx, vec![]);
+    let rect = texts(&output).into_iter()
+        .find(|(text, _)| text == label)
+        .map(|(_, rect)| rect)
+        .unwrap_or_else(|| panic!("navigation label not rendered: {label}"));
+    click(app, ctx, rect.center());
+    frame(app, ctx, vec![]);
+}
+
 fn frame(app: &mut desktop::Workbench, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
     let mut output = ctx.run_ui(egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100., 1200.))),
@@ -70,7 +86,9 @@ fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
     found
 }
 fn scroll(app: &mut desktop::Workbench, ctx: &egui::Context, delta: f32) {
-    frame(app, ctx, vec![egui::Event::PointerMoved(egui::pos2(1040., 420.)), egui::Event::MouseWheel {
+    // The real-mode onboarding panel occupies the top 450px; keep wheel input
+    // inside the project-detail scroll area so review controls below the fold move.
+    frame(app, ctx, vec![egui::Event::PointerMoved(egui::pos2(1040., 900.)), egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., delta), phase: egui::TouchPhase::Move,
         source: egui::MouseWheelSource::Wheel, modifiers: Default::default()
     }]);
@@ -144,7 +162,7 @@ fn pending_exit_rejection_click_persists_the_entered_reason() {
     let t = tempfile::tempdir().unwrap();
     let (mut app, ctx, id) = recovered_pending_exit(t.path());
     let task_title = "库存扣减 · pending";
-    let label = seek(&mut app, &ctx, "驳回原因", Some(task_title));
+    let _label = seek(&mut app, &ctx, "驳回原因", Some(task_title));
     // seek() parks the anchor at the scroll viewport's bottom edge; the fixed
     // +20 click offset can land in the widget below the task group once the
     // taller wizard rail pushes the layout (same lesson as the repair editor).

@@ -37,6 +37,14 @@ impl Projects{
  pub fn open(state:&Path)->Result<Self> {let store=Store::open(&state.join("project-workflow/controller.sqlite"),"native-project-workflow",&[])?;store.db.execute_batch("CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,body TEXT NOT NULL);CREATE TABLE IF NOT EXISTS project_documents(project TEXT NOT NULL,version INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(project,version));CREATE TABLE IF NOT EXISTS project_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;let mut items={let mut q=store.db.prepare("SELECT body FROM projects ORDER BY rowid")?;q.query_map([],|r|r.get::<_,String>(0))?.map(|r|Ok(serde_json::from_str::<ProjectSnapshot>(&r?)?)).collect::<Result<Vec<_>>>()?};for p in &mut items{project(p);}let config=store.db.query_row("SELECT value FROM project_settings WHERE key='config'",[],|r|r.get::<_,String>(0)).ok().map(PathBuf::from);Ok(Self{store,items,config,state:state.canonicalize()?,engine:None})}
  fn managed_paths(&self,id:&str)->Result<(String,String)>{ensure!(uuid::Uuid::parse_str(id).is_ok(),"managed project UUID required");let projects=self.state.join("projects");let root=projects.join(id);let product=root.join("product");for path in [&projects,&root,&product]{match std::fs::symlink_metadata(path){Ok(m)=>ensure!(m.is_dir()&&!m.file_type().is_symlink(),"managed directory must not be a link or file"),Err(e)if e.kind()==std::io::ErrorKind::NotFound=>std::fs::create_dir(path)?,Err(e)=>return Err(e.into())}ensure!(path.canonicalize()?.starts_with(&self.state),"managed path escaped state root");}Ok((root.canonicalize()?.to_string_lossy().into(),product.canonicalize()?.to_string_lossy().into()))}
  pub fn snapshots(&self)->Vec<ProjectSnapshot>{self.items.clone()}
+ pub fn confirmed_document(&self,project_id:&str)->Result<super::project_work::ConfirmedDocument>{
+  let project=self.items.iter().find(|project|project.id==project_id).context("unknown project")?;
+  let document=project.document.as_ref().context("confirmed document required")?;
+  ensure!(document.confirmed,"confirmed document required");
+  ensure!(document.version>0&&!document.text.trim().is_empty(),"confirmed document is empty");
+  ensure!(document.sha256==hex::encode(Sha256::digest(document.text.as_bytes())),"stored confirmed document hash mismatch");
+  Ok(super::project_work::ConfirmedDocument{version:document.version,sha256:document.sha256.clone(),text:document.text.clone()})
+ }
  fn project_run_actor(&self,run:&Run)->Result<Actor>{
   ensure!(run.template=="project-work-v1","project template required");
   let work:super::project_work::ProjectWork=serde_json::from_value(run.detail.get("project_work").context("project work missing")?.clone())?;

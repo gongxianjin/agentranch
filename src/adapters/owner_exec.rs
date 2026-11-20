@@ -13,7 +13,7 @@ mod linux {
     use super::policy;
     use std::{fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, thread::JoinHandle, time::{Duration, Instant}};
     use std::os::unix::{fs::OpenOptionsExt, process::{CommandExt, ExitStatusExt}};
-    use crate::core::{owner_producer::{CleanupFacts, LaunchFacts, OwnedProcessPort, OwnerLaunchPlan, StreamReadOutcome, TerminalFacts}, worker_owner::{OwnerProcessIdentity, derive_owner_handle}, native_worker::CgroupRootMode};
+    use crate::core::{live_output::capture_with_live, owner_producer::{CleanupFacts, LaunchFacts, OwnedProcessPort, OwnerLaunchPlan, StreamReadOutcome, TerminalFacts}, worker_owner::{OwnerProcessIdentity, derive_owner_handle}, native_worker::CgroupRootMode};
     const PREFIX: usize = 4096;
     const CGROUP2_MAGIC: libc::c_long = 0x63677270;
 
@@ -211,7 +211,13 @@ mod linux {
             let stdout = child.stdout.take().context("stdout pipe missing")?;
             let stderr = child.stderr.take().context("stderr pipe missing")?;
             self.stdout = Some(std::thread::spawn(move || capture(stdout)));
-            self.stderr = Some(std::thread::spawn(move || capture(stderr)));
+            self.stderr = Some(std::thread::spawn(move || {
+                let mut forward = |bytes: &[u8]| {
+                    let _ = std::io::stderr().write_all(bytes);
+                    let _ = std::io::stderr().flush();
+                };
+                capture_with_live(stderr, &mut forward)
+            }));
             child.stdin.take().context("owner gate missing")?.write_all(b"G").context("NOT_READY: writing owner gate failed")?;
             Ok(LaunchFacts {child_pid:pid,child_start_ticks:ticks,pgid})
         }

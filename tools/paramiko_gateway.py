@@ -15,6 +15,7 @@ import sys
 import time
 from typing import Any
 
+
 MAGIC = b"AO-PARAMIKO-GATEWAY/1\n"
 MAX_METADATA = 64 * 1024
 MAX_PRIVATE_KEY = 64 * 1024
@@ -22,6 +23,7 @@ MAX_MODEL_TOKEN = 16 * 1024
 MAX_FRAME = 192 * 1024
 MAX_STDOUT = 1024 * 1024
 MAX_STDERR = 64 * 1024
+LIVE_PREFIX = b"AO-LIVE "
 
 
 class BoundedBuffer:
@@ -181,6 +183,49 @@ def _write(stream, value: bytes) -> None:
     stream.flush()
 
 
+def _forward_stderr_chunk(chunk: bytes, pending: bytearray, err: BoundedBuffer, secrets: list[bytes]) -> None:
+    """Forward complete AO-LIVE lines immediately; retain all other stderr.
+
+    Live output is a display-only side channel. Ordinary stderr remains in the
+    bounded final diagnostic stream, while the live side channel has no shared
+    diagnostic budget. A malformed AO-LIVE-looking line is ordinary stderr.
+    """
+    pending.extend(chunk)
+    while b"\n" in pending:
+        line, _, rest = pending.partition(b"\n")
+        pending[:] = rest
+        wire = line + b"\n"
+        if wire.startswith(LIVE_PREFIX):
+            try:
+                event = json.loads(wire[len(LIVE_PREFIX):].decode("utf-8"))
+                kind = event.get("kind") if isinstance(event, dict) else None
+                expected_keys = {"kind"} if kind in {"connected", "model_finished"} else {"kind", "text"} if kind in {"delta", "error"} else None
+                if expected_keys is not None and set(event) == expected_keys and (kind in {"connected", "model_finished"} or isinstance(event.get("text"), str)):
+                    # Preserve existing exact-known-secret replacement on this
+                    # immediate path too, including JSON-escaped newlines.
+                    if isinstance(event.get("text"), str):
+                        text = event["text"].encode("utf-8")
+                        for secret in secrets:
+                            text = redact_output(text, secret)
+                        if text != event["text"].encode("utf-8"):
+                            event["text"] = text.decode("utf-8")
+                            wire = LIVE_PREFIX + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+                    _write(sys.stderr.buffer, wire)
+                    continue
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+        err.append(wire)
+    if len(pending) > MAX_STDERR:
+        err.append(bytes(pending))
+        pending.clear()
+
+
+def _flush_stderr_pending(pending: bytearray, err: BoundedBuffer) -> None:
+    if pending:
+        err.append(bytes(pending))
+        pending.clear()
+
+
 def _remaining(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -232,8 +277,6 @@ def exchange(metadata: dict[str, Any], private_key: bytes, started: float | None
         stdin.write(request)
         stdin.flush()
         if model_token:
-            # Length-framed so the worker can read exactly this many bytes
-            # after the newline-terminated start frame; never logged.
             stdin.write(struct.pack(">I", len(model_token)))
             stdin.write(model_token)
             stdin.flush()
@@ -244,6 +287,7 @@ def exchange(metadata: dict[str, Any], private_key: bytes, started: float | None
             _remaining(channel_deadline)
         out = BoundedBuffer(MAX_STDOUT)
         err = BoundedBuffer(MAX_STDERR)
+        live_pending = bytearray()
         try:
             while not channel.exit_status_ready() or channel.recv_ready() or channel.recv_stderr_ready():
                 remaining = channel_deadline - time.monotonic()
@@ -260,15 +304,17 @@ def exchange(metadata: dict[str, Any], private_key: bytes, started: float | None
                         channel.settimeout(_remaining(channel_deadline))
                     chunk = channel.recv_stderr(65536)
                     if chunk:
-                        err.append(chunk)
+                        _forward_stderr_chunk(chunk, live_pending, err, secrets)
                 if not channel.recv_ready() and not channel.recv_stderr_ready():
                     time.sleep(min(remaining, 0.05))
+            _flush_stderr_pending(live_pending, err)
             if delegated:
                 channel.settimeout(_remaining(channel_deadline))
             status = int(channel.recv_exit_status())
             if delegated:
                 _remaining(channel_deadline)
         except Exception as exc:
+            _flush_stderr_pending(live_pending, err)
             failure = exc
     except Exception as exc:
         failure = exc
