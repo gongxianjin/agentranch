@@ -211,8 +211,8 @@ impl agentranch::core::provision::Provisioner for FixtureProvisioner {
 fn bundle(root: &Path) -> PathBuf {
     let bundle = root.join("bundle"); std::fs::create_dir(&bundle).unwrap();
     for (name, content) in [("aw-cli", b"worker".as_slice()), ("libsqlite3.so.0", b"loader".as_slice()), ("known_hosts", b"fixture-host-key\n".as_slice()), ("model.pem", b"-----BEGIN CERTIFICATE-----\nsynthetic\n-----END CERTIFICATE-----\n".as_slice())] { std::fs::write(bundle.join(name), content).unwrap(); }
-    write_json(&bundle.join("assets.json"), &json!({"schema":"worker-provision-assets/1","version":"0.3.0","worker":{"path":"aw-cli","bytes":6,"sha256":sha(b"worker")},"loader":{"path":"libsqlite3.so.0","bytes":6,"sha256":sha(b"loader")}}));
-    write_json(&bundle.join("provisioning-prerequisites.json"), &json!({"schema":"worker-provision-prerequisites/1","asset_manifest":"assets.json","asset_version":"0.3.0","known_hosts":"known_hosts","tls_certificate":"model.pem"}));
+    write_json(&bundle.join("assets.json"), &json!({"schema":"worker-provision-assets/1","version":"0.3.1","worker":{"path":"aw-cli","bytes":6,"sha256":sha(b"worker")},"loader":{"path":"libsqlite3.so.0","bytes":6,"sha256":sha(b"loader")}}));
+    write_json(&bundle.join("provisioning-prerequisites.json"), &json!({"schema":"worker-provision-prerequisites/1","asset_manifest":"assets.json","asset_version":"0.3.1","known_hosts":"known_hosts","tls_certificate":"model.pem"}));
     bundle
 }
 
@@ -1200,7 +1200,7 @@ fn done_result_summary_separates_admission_from_task_status() {
     assert!(text.contains("回执提示：核对产物目录和操作回执"), "missing receipt guidance: {text}");
     assert!(!text.contains("完成 Worker 准备并确认上传版本后，才能提交项目。"), "terminal result must not retain pre-submit guidance: {text}");
     assert!(!text.contains("已有项目任务执行中或结果未知；请查看执行活动，当前不能再次提交。"), "terminal result must not retain active-task guidance: {text}");
-    assert!(!text.contains("打开产物目录"));
+    assert!(text.contains("打开产物目录"), "admitted result must offer the artifact folder: {text}");
     service.stop();
 }
 
@@ -1247,7 +1247,7 @@ fn unknown_result_summary_keeps_slot_and_points_to_receipt() {
     assert!(text.contains("产物目录：尚未物化"), "unknown must not claim an artifact: {text}");
     assert!(text.contains("名额保留；不要手动释放或自动重跑"), "missing unknown safety guidance: {text}");
     assert!(!text.contains("准入状态：已准入"));
-    assert!(!text.contains("打开产物目录"));
+    assert!(!text.contains("打开产物目录"), "unknown result must not offer an artifact folder: {text}");
     service.stop();
 }
 
@@ -1310,6 +1310,42 @@ fn result_summary_remains_project_scoped_after_switch() {
     let first_text = paint_projects_text(&mut projects, &snapshot);
     assert!(first_text.contains("最终任务结果：完成"), "first project lost completed summary: {first_text}");
     assert!(first_text.contains(&format!("产物目录：{artifact_dir}")), "first project lost its artifact path: {first_text}");
+    service.stop();
+}
+
+#[cfg(feature = "gui")]
+#[test]
+fn admitted_result_lists_committed_artifact_files_and_survives_missing_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut service, id) = streaming_service(root.path(), Arc::new(AtomicBool::new(true)), false);
+    let request = service.try_submit(UiCommand::ProjectWorkSubmit { project_id: id.clone() }).unwrap();
+    let result = wait_for(&mut service, request).result.unwrap();
+    assert_eq!(result["status"], "done");
+    let run_id = result["run_id"].as_str().unwrap().to_owned();
+    let artifact_dir = result["artifact_dir"].as_str().unwrap().to_owned();
+    let written: Vec<String> = result["artifact_files"].as_array().unwrap()
+        .iter().map(|file| file.as_str().unwrap().to_owned()).collect();
+    assert!(!written.is_empty(), "fixture must materialize at least one file");
+    let snapshot = (*wait_for_snapshot_run(&mut service, &run_id)).clone();
+    // The snapshot must carry the same committed write log the receipt exposed.
+    let view = snapshot.runs.iter().find(|view| view.run.id == run_id).unwrap();
+    let listed: Vec<String> = view.run.detail["artifact_files"].as_array().unwrap()
+        .iter().map(|file| file.as_str().unwrap().to_owned()).collect();
+    assert_eq!(listed, written, "snapshot artifact_files must match the committed write log");
+    let mut projects = desktop::projects::Projects::default();
+    projects.selected = Some(id.clone());
+    let text = paint_projects_text(&mut projects, &snapshot);
+    assert!(text.contains(&format!("已物化文件（{} 个）", written.len())), "missing artifact file header: {text}");
+    for relative in &written {
+        assert!(text.contains(relative.as_str()), "missing listed artifact file {relative}: {text}");
+    }
+    assert!(text.contains("打开产物目录"), "materialized directory must be openable: {text}");
+    // A recorded path whose directory is gone must not offer an action that
+    // would fail; the summary keeps the path as an honest record only.
+    std::fs::remove_dir_all(&artifact_dir).unwrap();
+    let missing = paint_projects_text(&mut projects, &snapshot);
+    assert!(missing.contains(&format!("产物目录：{artifact_dir}")), "recorded path must stay visible: {missing}");
+    assert!(!missing.contains("打开产物目录"), "missing directory must not offer an open action: {missing}");
     service.stop();
 }
 

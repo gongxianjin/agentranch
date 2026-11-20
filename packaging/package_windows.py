@@ -331,6 +331,9 @@ def main():
     parser.add_argument('--linux-build-result', type=Path)
     parser.add_argument('--objdump', type=Path, default=Path('C:/msys64/mingw64/bin/objdump.exe'))
     parser.add_argument('--system-dir', type=Path, default=Path('C:/Windows/System32'))
+    # Package version defaults to the source tree's Cargo.toml; the override
+    # exists only so a fixture test can prove the mismatch gate fires.
+    parser.add_argument('--package-version')
     args = parser.parse_args()
     root = args.source_root.resolve()
     output_parent = args.output_parent.resolve()
@@ -344,6 +347,9 @@ def main():
     require(args.runtime_dir.is_dir(), f'Input path missing: runtime directory: {args.runtime_dir}')
     require(args.system_dir.is_dir(), f'Input path missing: system directory: {args.system_dir}')
     require((args.python_runtime_dir is None) == (args.python_runtime_inventory is None), 'Python runtime directory and inventory must be provided together')
+    # One version authority for the whole package: the source tree we are
+    # packaging. Everything downstream (name, provisioning gate, notes) uses it.
+    version = args.package_version or cargo_context(root)['package_version']
     python_runtime = None
     runtime_inventory_sha = None
     if args.python_runtime_dir is not None:
@@ -355,7 +361,7 @@ def main():
         python_runtime['rust_transport_wiring'] = 'NOT_IMPLEMENTED_BY_PACKAGER'
     provisioning = None
     if args.provisioning_prerequisites_dir is not None:
-        provisioning = load_provisioning_bundle(args.provisioning_prerequisites_dir, '0.3.0')
+        provisioning = load_provisioning_bundle(args.provisioning_prerequisites_dir, version)
     source = json.loads(args.inventory.read_text(encoding='utf-8'))
     files = source['files']
     require(files and all(relative in files for relative in ('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'packaging/protocol-v1.md', 'README.md')), 'Incomplete source inventory')
@@ -379,7 +385,7 @@ def main():
     require(identity.get('target') == 'x86_64-pc-windows-gnu', 'Build identity target mismatch')
     require(identity.get('metadata_sha256') == digest(args.metadata), 'Build identity metadata mismatch')
     require(identity.get('toolchain') == context['toolchain'] == '1.99.1', 'Build identity toolchain mismatch')
-    require(identity.get('package_version') == context['package_version'] == '0.3.0', 'Build identity package version mismatch')
+    require(identity.get('package_version') == context['package_version'] == version, 'Build identity package version mismatch')
     require(files['Cargo.lock']['sha256'] == context['cargo_lock_sha256'], 'Cargo.lock context mismatch')
     require(files['Cargo.toml']['sha256'] == context['cargo_toml_sha256'], 'Cargo.toml context mismatch')
     require(files['rust-toolchain.toml']['sha256'] == context['rust_toolchain_sha256'], 'rust-toolchain context mismatch')
@@ -392,7 +398,7 @@ def main():
         require(binary_path.is_file() and not binary_path.is_symlink() and binary_path.read_bytes()[:2] == b'MZ', 'Release PE missing: ' + binary)
         spec = identity_executables[binary]
         require(spec.get('sha256') == digest(binary_path) and spec.get('bytes') == binary_path.stat().st_size, f'Executable identity drift: {binary}')
-    name = 'agentranch-0.3.0-windows-x86_64-' + args.profile + '-' + source_digest[:16]
+    name = f'agentranch-{version}-windows-x86_64-' + args.profile + '-' + source_digest[:16]
     output = output_parent / name
     archive = output_parent / (name + '.zip')
     existing_names = {path.name for path in output_parent.iterdir()} if output_parent.is_dir() else set()
@@ -540,7 +546,7 @@ def main():
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, destination)
         (output / 'PACKAGE-NOTES.txt').write_text(
-            'agentranch 0.3.0 - Windows x86_64 GNU\n'
+            f'agentranch {version} - Windows x86_64 GNU\n'
             'Double-click agentranch.exe. Keep aw-cli.exe beside it.\n'
             'Local experience is a Rust controlled fixture, NOT real AO/Reason/model execution.\n'
             + ('Bundled Python runtime is included at runtime/python/ with hash-bound ABI/version/license inventory; use runtime/python/python.exe for the explicitly configured Paramiko gateway.\n'

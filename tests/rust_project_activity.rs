@@ -384,3 +384,25 @@ fn waiting_and_streaming_have_no_remote_liveness_claim() {
     assert!(!streaming.contains("Worker 存活"));
     assert!(!streaming.contains("超时"));
 }
+
+// The export carries exactly the body this session received — never a
+// synthesized or replayed text — and offers no action while the body is empty.
+#[test]
+fn export_payload_is_exactly_the_received_body_and_gated_on_nonempty() {
+    let t = Instant::now();
+    let ctx = egui::Context::default();
+    let mut activity = ProjectActivity::new(7, "p".into(), t, 0);
+    assert_eq!(activity.export_payload(), None, "empty body must not be exportable");
+    assert!(activity.export_file_name().starts_with("agentranch-"), "export name must be identifiable");
+    assert!(activity.export_file_name().ends_with("-7.txt"), "export name must carry the request id");
+    let empty = texts(&frame(&mut activity, &ctx, t + Duration::from_secs(1), vec![]));
+    assert!(empty.contains("复制全部"), "copy control must stay discoverable: {empty}");
+    assert!(empty.contains("导出为 .txt"), "export control must stay discoverable: {empty}");
+    activity.apply(event(t + Duration::from_secs(2), LiveOutput::Delta("第一段\n".into()), 10, false));
+    activity.apply(event(t + Duration::from_secs(3), LiveOutput::Delta("<html>末尾</html>".into()), 34, false));
+    let expected = "第一段\n<html>末尾</html>";
+    assert_eq!(activity.export_payload(), Some(expected), "export must equal the exact received bytes");
+    let populated = texts(&frame(&mut activity, &ctx, t + Duration::from_secs(4), vec![]));
+    assert!(populated.contains("复制全部"));
+    assert!(populated.contains("导出为 .txt"));
+}

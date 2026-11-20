@@ -178,6 +178,37 @@ impl Projects {
             ui.small("仅显示当前会话收到的实际正文，不伪造模型思考；关闭工作台后不会恢复该正文。");
         });
     }
+    /// Materialized artifact files as recorded by the core after admission.
+    /// Display-only: the list is the core's committed write log, never a
+    /// directory scan of our own.
+    fn artifact_files(run: &RunView) -> Vec<String> {
+        let mut files: Vec<String> = run.run.detail["artifact_files"].as_array()
+            .map(|files| files.iter().filter_map(|file| file.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+    /// The "open the product" affordance. The path is only offered when the
+    /// core recorded it and the directory is actually on disk; opening is a
+    /// user convenience and never an execution authority.
+    fn render_artifact_access(ui: &mut egui::Ui, artifact_dir: Option<&str>, run: &RunView) {
+        let Some(path) = artifact_dir else { return; };
+        let directory = std::path::Path::new(path);
+        if !directory.is_dir() { return; }
+        let files = Self::artifact_files(run);
+        if !files.is_empty() {
+            ui.small(format!("已物化文件（{} 个）：", files.len()));
+            for relative in &files {
+                let size = std::fs::metadata(directory.join(relative)).ok().map(|meta| meta.len());
+                match size {
+                    Some(bytes) => ui.label(RichText::new(format!("· {relative}（{bytes} B）")).monospace().small()),
+                    None => ui.label(RichText::new(format!("· {relative}")).monospace().small()),
+                };
+            }
+        }
+        if ui.button("打开产物目录").clicked() { open_directory(directory); }
+        ui.small("目录已包含全部已准入文件；在该目录中直接打开产物即可，不需要重新提交任务。");
+    }
     fn render_result_summary(ui: &mut egui::Ui, work_run: Option<&RunView>) {
         ui.strong("结果核对");
         let Some(run) = work_run else {
@@ -199,6 +230,7 @@ impl Projects {
                     ui.label("准入状态：已准入");
                     ui.label(format!("产物目录：{}", artifact_dir.expect("checked above")));
                     ui.label("回执提示：核对产物目录和操作回执");
+                    Self::render_artifact_access(ui, artifact_dir, run);
                 } else {
                     ui.label("准入状态：未准入");
                     ui.label(format!("产物目录：{}", artifact_dir.unwrap_or("尚未物化")));
@@ -669,6 +701,27 @@ impl Projects {
     }
 }
 // Receipts are rendered from Workbench's passed-in view; see show().
+/// Reveal a materialized artifact directory in the OS file manager. The path
+/// always comes from the core's recorded artifact_dir; this only opens the
+/// user's own local folder and never launches, imports or executes anything.
+fn open_directory(directory: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let target: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
+        // Both buffers are live, NUL-terminated; ShellExecuteW returns
+        // immediately and the shell owns the folder window afterwards.
+        unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL); }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+    }
+}
+
 #[cfg(windows)]
 fn pick_document() -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;

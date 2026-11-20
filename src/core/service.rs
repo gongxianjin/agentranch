@@ -710,6 +710,9 @@ fn submit_confirmed_project_work(
    }
   };
   manager.annotate_run(&result.run_id,"artifact_dir",json!(target.display().to_string()))?;
+  // The committed write log is what the result page lists for the user; it is
+  // the core's own record of what it materialized, not a client-side scan.
+  manager.annotate_run(&result.run_id,"artifact_files",json!(written))?;
   value["artifact_dir"]=json!(target.display().to_string());
   value["artifact_files"]=json!(written);
   let _=append_diag(&options.state_dir,"artifact_materialized",&format!("run_id={} files={}",result.run_id,written.len()));

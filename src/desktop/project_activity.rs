@@ -20,12 +20,15 @@ pub struct ProjectActivity {
     truncated: bool,
     following: bool,
     seen_bytes: usize,
+    export_notice: Option<String>,
+    export_picker: Option<std::sync::mpsc::Receiver<Option<(std::path::PathBuf, String)>>>,
 }
 impl ProjectActivity {
     pub fn new(request_id: u64, project_id: String, now: Instant, submitted_unix_secs: u64) -> Self {
         Self { request_id, project_id, text: String::new(), connected: false, model_finished: false,
             task_status: None, error: None, submitted: now, submitted_unix_secs, returned: None,
-            last_output: None, received_bytes: 0, truncated: false, following: true, seen_bytes: 0 }
+            last_output: None, received_bytes: 0, truncated: false, following: true, seen_bytes: 0,
+            export_notice: None, export_picker: None }
     }
     pub fn apply(&mut self, event: LiveOutputEvent) {
         if self.request_id != event.request_id || self.project_id != event.project_id || self.returned.is_some() { return; }
@@ -116,10 +119,52 @@ impl ProjectActivity {
     pub fn truncation_note(&self) -> Option<&'static str> {
         self.truncated.then_some("展示已截断；完整正文：通过最终产物核对；当前面板仅保留前 1 MiB，未展示正文不会自动回放。")
     }
+    /// Default file name offered by the export dialog: identifies the project
+    /// and the request, never invents content.
+    pub fn export_file_name(&self) -> String {
+        let project: String = self.project_id.chars().take(8).collect();
+        format!("agentranch-{project}-{}.txt", self.request_id)
+    }
+    /// Exact bytes the export writes: the body this session received, verbatim.
+    pub fn export_payload(&self) -> Option<&str> {
+        (!self.text.is_empty()).then_some(self.text.as_str())
+    }
+    fn export_text(&mut self) {
+        let Some(payload) = self.export_payload().map(str::to_owned) else { return; };
+        // A native modal must not run inside the paint: the window would stop
+        // repainting while it is open. Spawn the picker the same way the
+        // document importer does and collect the chosen path on a later frame.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let name = self.export_file_name();
+        std::thread::spawn(move || {
+            let path = save_text_dialog(&name);
+            let _ = sender.send(path.map(|path| (path, payload)));
+        });
+        self.export_picker = Some(receiver);
+    }
+    fn collect_export_result(&mut self) {
+        let Some(receiver) = &self.export_picker else { return; };
+        match receiver.try_recv() {
+            Ok(None) => self.export_picker = None,
+            Ok(Some((path, payload))) => {
+                self.export_picker = None;
+                // Writing is a user-requested local file save; a failure is
+                // reported, never silently dropped, and never alters the
+                // live display.
+                self.export_notice = Some(match std::fs::write(&path, payload) {
+                    Ok(()) => format!("已导出到 {}", path.display()),
+                    Err(error) => format!("导出失败：{error}"),
+                });
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.export_picker = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
     pub fn render(&mut self, ui: &mut egui::Ui, now: Instant) {
         self.render_with_published_status(ui, now, None);
     }
     pub fn render_with_published_status(&mut self, ui: &mut egui::Ui, now: Instant, published_status: Option<&str>) {
+        self.collect_export_result();
         // Snapshot authority affects this paint only, never the local status
         // used by submission barriers or the operation receipt/error.
         let status = published_status.filter(|status| matches!(*status, "done" | "failed" | "cancelled" | "unknown"))
@@ -142,6 +187,8 @@ impl ProjectActivity {
                 None => "尚未收到正文；等待不代表任务失败。".into(),
             });
             let mut jump = false;
+            let mut copy_all = false;
+            let mut export = false;
             ui.horizontal_wrapped(|ui| {
                 ui.strong("模型输出（纯文本）");
                 ui.label(if self.following { "跟随最新" } else { "正在查看前文" });
@@ -149,7 +196,14 @@ impl ProjectActivity {
                     ui.label(format!("有新内容 · {} bytes", self.received_bytes - self.seen_bytes));
                 }
                 jump = ui.small_button("回到最新").clicked();
+                let has_body = !self.text.is_empty();
+                copy_all = ui.add_enabled(has_body, egui::Button::new("复制全部").small()).clicked();
+                export = ui.add_enabled(has_body, egui::Button::new("导出为 .txt").small()).clicked();
             });
+            // Copy/export carry only the body this session actually received;
+            // they never synthesize text and never re-read a persisted history.
+            if copy_all { ui.ctx().copy_text(self.text.clone()); }
+            if export { self.export_text(); }
             let view = egui::ScrollArea::vertical().id_salt(("model-output", self.request_id))
                 .max_height(320.).auto_shrink([false, true]).stick_to_bottom(true)
                 .animated(false).show(ui, |ui| {
@@ -170,6 +224,7 @@ impl ProjectActivity {
             if self.following { self.seen_bytes = self.received_bytes; }
             if let Some(note) = self.truncation_note() { ui.colored_label(theme::WARN, note); }
             if let Some(error) = &self.error { ui.colored_label(theme::WARN, error); }
+            if let Some(notice) = &self.export_notice { ui.small(notice); }
             if self.model_finished && status.is_none() { ui.small("模型输出已结束；任务结果仍以终态证据与产物准入为准。"); }
             if let Some(status) = &status {
                 ui.small(match status.as_str() {
@@ -183,3 +238,32 @@ impl ProjectActivity {
         });
     }
 }
+
+/// Native save dialog for the plain-text export. Returns the chosen path or
+/// None when the user cancels; the default name is adopted verbatim when the
+/// user types none.
+#[cfg(windows)]
+fn save_text_dialog(default_name: &str) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OPENFILENAMEW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OFN_NOCHANGEDIR};
+    let mut file = vec![0u16; 32768];
+    for (slot, unit) in file.iter_mut().zip(default_name.encode_utf16()) { *slot = unit; }
+    let filter: Vec<u16> = "纯文本 (*.txt)\0*.txt\0\0".encode_utf16().collect();
+    let title: Vec<u16> = "导出模型实际输出\0".encode_utf16().collect();
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFilter: filter.as_ptr(),
+        lpstrFile: file.as_mut_ptr(),
+        nMaxFile: file.len() as u32,
+        lpstrTitle: title.as_ptr(),
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    // Buffers outlive the synchronous native call; the dialog runs on the UI
+    // thread the same way the import picker does.
+    if unsafe { GetSaveFileNameW(&mut dialog) } == 0 { return None; }
+    let length = file.iter().position(|value| *value == 0)?;
+    Some(std::ffi::OsString::from_wide(&file[..length]).into())
+}
+#[cfg(not(windows))]
+fn save_text_dialog(_: &str) -> Option<std::path::PathBuf> { None }

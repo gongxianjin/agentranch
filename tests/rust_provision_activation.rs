@@ -106,10 +106,10 @@ fn bundle(root:&Path)->PathBuf {
         ("model.pem", &b"-----BEGIN CERTIFICATE-----\nsynthetic\n-----END CERTIFICATE-----\n"[..])] {
         std::fs::write(bundle.join(name),raw).unwrap();
     }
-    write_json(&bundle.join("assets.json"),&json!({"schema":"worker-provision-assets/1","version":"0.3.0",
+    write_json(&bundle.join("assets.json"),&json!({"schema":"worker-provision-assets/1","version":"0.3.1",
         "worker":{"path":"aw-cli","bytes":6,"sha256":sha(b"worker")},"loader":{"path":"libsqlite3.so.0","bytes":6,"sha256":sha(b"loader")}}));
     write_json(&bundle.join("provisioning-prerequisites.json"),&json!({"schema":"worker-provision-prerequisites/1","asset_manifest":"assets.json",
-        "asset_version":"0.3.0","known_hosts":"known_hosts","tls_certificate":"model.pem"}));
+        "asset_version":"0.3.1","known_hosts":"known_hosts","tls_certificate":"model.pem"}));
     bundle
 }
 fn service(root:&Path, mutation:&'static str)->(ServiceHandle, Arc<AtomicUsize>) {
