@@ -1,5 +1,6 @@
 pub mod action;
 pub mod approval;
+pub mod connection_settings;
 pub mod launch;
 pub mod pending;
 pub mod projects;
@@ -28,21 +29,21 @@ pub fn onboarding_input_error_copy(error: &anyhow::Error) -> String {
         || message.contains("host must be an IPv4 address")
         || message.contains("host is required")
     {
-        return "Linux 工作节点 IP 无效，请填写 IPv4 地址，例如 192.168.1.20".into();
+        return "Worker IP 无效，请填写 IPv4 地址，例如 192.168.1.20".into();
     }
     if message.contains("root_user") {
-        return "root 账号无效，请填写不含空格或控制字符的账号名".into();
+        return "Worker 账号无效，请填写不含空格或控制字符的账号名".into();
     }
     if message.contains("root_password") {
-        return "请填写 root 密码；仅用于本次准备，不会写入回执或日志".into();
+        return "请填写 Worker 密码；保存在本机明文配置文件，不写入回执或日志".into();
     }
     if message.contains("model_token") {
-        return "请填写 API key；仅用于本次准备，不会写入回执或日志".into();
+        return "请填写 API key；保存在本机明文配置文件，不写入日志或回执".into();
     }
     if message.contains("model") {
         return "请填写默认模型，例如 gpt-6.1-sol".into();
     }
-    "输入未通过校验，请检查六项信息后重试".into()
+    "输入未通过校验，请检查模型配置与 Worker 列表后重试".into()
 }
 
 struct Receipt { id: u64, action: String, detail: String, diagnostic_detail: String, failed: bool }
@@ -145,12 +146,11 @@ pub struct Workbench {
     receipts: VecDeque<Receipt>,
     selected: Option<String>,
     template: String,
-    onboarding_host: String,
-    onboarding_root_user: String,
-    onboarding_root_password: String,
     onboarding_model_base_url: String,
     onboarding_model_token: String,
     onboarding_model: String,
+    configured_workers: Vec<connection_settings::ConfiguredWorker>,
+    connection_settings_store: connection_settings::ConnectionSettingsStore,
     gateway_worker: String,
     onboarding_form_open: bool,
     onboarding_input_error: Option<String>,
@@ -216,45 +216,87 @@ impl Workbench {
         let settings_store = worker_settings::SettingsStore::new(std::path::Path::new(&state_dir));
         #[cfg(test)]
         let settings_store = worker_settings::SettingsStore::with_vault(std::path::Path::new(&state_dir), Box::new(settings_vault::TestVault));
-        let mut app = Self { service, pending: Default::default(), receipts: VecDeque::new(), selected: None, template, onboarding_host: String::new(), onboarding_root_user: String::new(), onboarding_root_password: String::new(), onboarding_model_base_url: String::new(), onboarding_model_token: String::new(), onboarding_model: String::new(), gateway_worker: String::new(), onboarding_form_open: false, onboarding_input_error: None, onboarding_failure: None, onboarding_reprepare_requested: false, settings_store, settings_notice: None, token_origin: String::new(), state_dir, notice: None, confirm_close: false, closing: false, close_requested: false, projects: Default::default(), diagnostics: false, project_diagnostics: false, #[cfg(test)] snapshot_override: None };
+        let connection_settings_store = connection_settings::ConnectionSettingsStore::new(std::path::Path::new(&state_dir));
+        let mut app = Self { service, pending: Default::default(), receipts: VecDeque::new(), selected: None, template, onboarding_model_base_url: String::new(), onboarding_model_token: String::new(), onboarding_model: String::new(), configured_workers: Vec::new(), connection_settings_store, gateway_worker: String::new(), onboarding_form_open: false, onboarding_input_error: None, onboarding_failure: None, onboarding_reprepare_requested: false, settings_store, settings_notice: None, token_origin: String::new(), state_dir, notice: None, confirm_close: false, closing: false, close_requested: false, projects: Default::default(), diagnostics: false, project_diagnostics: false, #[cfg(test)] snapshot_override: None };
         app.restore_connection_settings();
+        // At least one worker must always be configurable; a role's fields are
+        // only ever added here, never inferred from a previous single-worker form.
+        if app.configured_workers.is_empty() {
+            app.configured_workers.push(connection_settings::ConfiguredWorker {
+                id: format!("worker-{}", connection_settings::WorkerRole::Split.as_str()),
+                role: connection_settings::WorkerRole::Split,
+                host: String::new(), username: "root".into(), password: String::new(),
+            });
+        }
+        // First launch shows the settings once so the model/worker fields are
+        // discoverable. It is a configuration affordance only: nothing is saved,
+        // prepared or executed until the user clicks a button.
+        if app.service.snapshot().mode == Mode::Real && app.onboarding_model_base_url.is_empty() {
+            app.onboarding_form_open = true;
+            app.onboarding_reprepare_requested = true;
+        }
         app
     }
 
     fn restore_connection_settings(&mut self) {
+        match self.connection_settings_store.load() {
+            Ok(Some(saved)) => {
+                self.configured_workers = saved.workers;
+                self.onboarding_model_base_url = saved.model.base_url;
+                self.onboarding_model_token = saved.model.api_key;
+                self.onboarding_model = saved.model.model;
+                self.token_origin = self.onboarding_model_base_url.clone();
+                self.settings_notice = Some("已恢复模型配置和 Worker 列表；保存不代表 Worker 已连接。".into());
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.settings_notice = Some(error.to_string());
+                return;
+            }
+        }
+        // Legacy v1 settings remain readable for an upgrade path. They are not
+        // rewritten into the plaintext file until the user explicitly saves.
         match self.settings_store.load() {
             Ok(Some(saved)) => {
-                self.onboarding_host = saved.settings.host;
-                self.onboarding_root_user = saved.settings.root_user;
                 self.onboarding_model_base_url = saved.settings.model_base_url;
                 self.onboarding_model = saved.settings.model;
+                self.configured_workers = vec![connection_settings::ConfiguredWorker {
+                    id: "worker-develop".into(), role: connection_settings::WorkerRole::Develop,
+                    host: saved.settings.host, username: saved.settings.root_user, password: String::new(),
+                }];
                 match saved.token {
                     Ok(token) => {
                         self.token_origin = self.onboarding_model_base_url.clone();
                         self.onboarding_model_token = token;
-                        self.settings_notice = Some("已恢复保存配置；仍需当前会话认证，不代表 Worker 已连接。".into());
+                        self.settings_notice = Some("已恢复旧版配置；请重新填写 Worker 密码后保存为新版明文配置。".into());
                     }
                     Err(error) => {
                         self.onboarding_model_token.clear();
                         self.token_origin.clear();
-                        self.settings_notice = Some(format!("四项普通配置已恢复；API key 未恢复，请重新输入并保存。恢复配置不代表 Worker 已连接。\n{error}"));
+                        self.settings_notice = Some(format!("旧版普通配置已恢复；API key 未恢复，请重新输入并保存。\n{error}"));
                     }
                 }
             }
-            Ok(None) => {},
+            Ok(None) => {}
             Err(error) => self.settings_notice = Some(error.to_string()),
         }
     }
 
     fn save_connection_settings(&mut self) -> bool {
-        let settings = worker_settings::WorkerSettings {
-            host: self.onboarding_host.trim().into(), root_user: self.onboarding_root_user.trim().into(),
-            model_base_url: self.onboarding_model_base_url.trim().into(), model: self.onboarding_model.trim().into(),
+        let settings = connection_settings::ConnectionSettings {
+            schema: connection_settings::CURRENT_SCHEMA,
+            model: connection_settings::ModelSettings {
+                base_url: self.onboarding_model_base_url.trim().into(),
+                api_key: self.onboarding_model_token.clone(),
+                model: self.onboarding_model.trim().into(),
+            },
+            workers: self.configured_workers.clone(),
         };
-        match self.settings_store.save(&settings, &self.onboarding_model_token) {
+        match self.connection_settings_store.save(&settings) {
             Ok(()) => {
-                self.token_origin = settings.model_base_url;
-                self.settings_notice = Some("配置已保存；API key 已安全保存，root 密码不保存。保存不代表 Worker 已连接。".into());
+                self.token_origin = settings.model.base_url;
+                self.settings_notice = Some("配置已保存到本机明文文件；保存不代表 Worker 已连接。".into());
                 true
             }
             Err(error) => { self.settings_notice = Some(error.to_string()); false }
@@ -287,7 +329,7 @@ impl Workbench {
                     }
                     self.onboarding_failure = Some((e.code.clone(), e.next_step.clone()));
                     self.onboarding_reprepare_requested = false;
-                    self.onboarding_root_password.clear();
+                    for worker in &mut self.configured_workers { worker.password.clear(); }
                     self.onboarding_model_token.clear();
                     self.onboarding_form_open = true;
                 }
@@ -324,9 +366,11 @@ impl Workbench {
 
     #[cfg(test)]
     pub fn set_onboarding_fields_for_test(&mut self, host: &str, root_user: &str, password: &str, base_url: &str, token: &str, model: &str) {
-        self.onboarding_host = host.into();
-        self.onboarding_root_user = root_user.into();
-        self.onboarding_root_password = password.into();
+        let worker = connection_settings::ConfiguredWorker {
+            id: "worker-split".into(), role: connection_settings::WorkerRole::Split,
+            host: host.into(), username: root_user.into(), password: password.into(),
+        };
+        self.configured_workers = vec![worker];
         self.onboarding_model_base_url = base_url.into();
         self.onboarding_model_token = token.into();
         self.onboarding_model = model.into();
@@ -334,7 +378,29 @@ impl Workbench {
 
     #[cfg(test)]
     pub fn onboarding_secrets_empty_for_test(&self) -> bool {
-        self.onboarding_root_password.is_empty() && self.onboarding_model_token.is_empty()
+        self.configured_workers.iter().all(|worker| worker.password.is_empty()) && self.onboarding_model_token.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn configured_workers_for_test(&self) -> Vec<(connection_settings::WorkerRole, String, String, String)> {
+        self.configured_workers.iter().map(|worker| (worker.role, worker.host.clone(), worker.username.clone(), worker.password.clone())).collect()
+    }
+
+    /// Replace the whole worker list with one entry per role, in pipeline order.
+    #[cfg(test)]
+    pub fn set_configured_workers_for_test(&mut self, hosts: [&str; 4], password: &str) {
+        self.configured_workers = connection_settings::WorkerRole::ALL.iter().zip(hosts).map(|(role, host)| connection_settings::ConfiguredWorker {
+            id: format!("worker-{}", role.as_str()), role: *role,
+            host: host.into(), username: "root".into(), password: password.into(),
+        }).collect();
+    }
+
+    /// Roles the add control would still offer, in pipeline order.
+    #[cfg(test)]
+    pub fn addable_roles_for_test(&self) -> Vec<connection_settings::WorkerRole> {
+        connection_settings::WorkerRole::ALL.iter().copied()
+            .filter(|role| !self.configured_workers.iter().any(|worker| worker.role == *role))
+            .collect()
     }
 
     #[cfg(test)]
@@ -375,19 +441,12 @@ impl Workbench {
 
     fn reopen_onboarding_form(&mut self) {
         if self.onboarding_model_token.is_empty() {
-            match self.settings_store.load() {
-                Ok(Some(saved)) if saved.settings.model_base_url == self.onboarding_model_base_url.trim() => {
-                    match saved.token {
-                        Ok(token) => {
-                            self.token_origin = saved.settings.model_base_url;
-                            self.onboarding_model_token = token;
-                            self.settings_notice = Some("API key 已恢复；当前表单内容已保留，仍需当前会话认证，不代表 Worker 已连接。".into());
-                        }
-                        Err(error) => {
-                            self.token_origin.clear();
-                            self.settings_notice = Some(format!("四项普通配置已保留；API key 未恢复，请重新输入并保存。恢复配置不代表 Worker 已连接。\n{error}"));
-                        }
-                    }
+            match self.connection_settings_store.load() {
+                Ok(Some(saved)) if saved.model.base_url == self.onboarding_model_base_url.trim() => {
+                    self.configured_workers = saved.workers;
+                    self.onboarding_model_token = saved.model.api_key;
+                    self.token_origin = saved.model.base_url;
+                    self.settings_notice = Some("已恢复本机明文配置；仍需当前会话认证，不代表 Worker 已连接。".into());
                 }
                 Err(error) => self.settings_notice = Some(error.to_string()),
                 _ => {},
@@ -661,14 +720,14 @@ impl Workbench {
     fn dismiss_connection_settings(&mut self) {
         self.onboarding_form_open = false;
         self.onboarding_reprepare_requested = false;
-        self.onboarding_root_password.clear();
+        for worker in &mut self.configured_workers { worker.password.clear(); }
         self.onboarding_model_token.clear();
     }
 
     fn render_connection_settings(&mut self, ctx: &egui::Context, snapshot: &AppSnapshot) {
         let response = egui::Modal::new(egui::Id::unique("connection-settings")).show(ctx, |ui| {
             let viewport = ctx.content_rect().size();
-            ui.set_width((viewport.x - 64.).clamp(280., 640.));
+            ui.set_width((viewport.x - 64.).clamp(280., 720.));
             ui.heading("连接 Linux Worker");
             let body_height = (viewport.y - 190.).clamp(120., 640.);
             egui::ScrollArea::vertical().id_salt("connection-settings-body")
@@ -678,23 +737,11 @@ impl Workbench {
             if let Some((code, next)) = &self.onboarding_failure { ui.label(format!("准备失败：{code}；下一步：{next}")); }
             if snapshot.gateway.as_ref().is_some_and(|gateway| gateway.credentials_available) { ui.small("已连接的 Worker 不会被替换；如需更换，请关闭并重新打开工作台。"); }
             if snapshot.gateway.as_ref().is_some_and(|gateway| !gateway.credentials_available) { ui.small("会话已超时；本次重新准备会创建新的隔离输出，不会删除旧远端残留。"); }
-            ui.small("只需填写六项信息；程序会自动准备并连接 Worker。");
             ui.small("支持 Ctrl+C/Ctrl+V：可从记事本复制内容后粘贴到任意输入框。");
-            ui.horizontal(|ui| {
-                ui.label("Linux 工作节点 IP");
-                ui.text_edit_singleline(&mut self.onboarding_host);
-                ui.small("例如 192.168.1.20");
-            });
-            ui.horizontal(|ui| {
-                ui.label("root 账号");
-                ui.text_edit_singleline(&mut self.onboarding_root_user);
-                ui.small("通常为 root");
-            });
-            ui.horizontal(|ui| {
-                ui.label("root 密码");
-                Self::password_text_edit_with_copy(ui, &mut self.onboarding_root_password);
-                ui.small("仅用于本次准备，不会写入回执或日志");
-            });
+
+            ui.separator();
+            ui.heading("模型配置");
+            ui.small("三项：模型服务地址、API key、默认模型。全部明文保存在本机配置文件。");
             ui.horizontal(|ui| {
                 ui.label("模型服务地址");
                 if ui.text_edit_singleline(&mut self.onboarding_model_base_url).changed() && !self.token_origin.is_empty() {
@@ -707,23 +754,72 @@ impl Workbench {
             ui.horizontal(|ui| {
                 ui.label("API key");
                 Self::password_text_edit_with_copy(ui, &mut self.onboarding_model_token);
-                ui.small("保存到 Windows 凭据管理器，不写入普通配置或日志");
+                ui.small("明文保存在本机配置文件，不写入日志或回执");
             });
             ui.horizontal(|ui| {
                 ui.label("默认模型");
                 ui.text_edit_singleline(&mut self.onboarding_model);
                 ui.small("例如 gpt-6.1-sol");
             });
-            ui.small("Windows 只负责控制和显示；任务负载、模型调用和资源门禁在 Linux Worker 上执行。");
+
+            ui.separator();
+            ui.heading("Worker 配置机");
+            ui.small("四台固定角色，各一台：拆分 → 开发 → 测试 → 审查。每组含 IP、账号、密码。");
+            ui.small("当前版本只连接并执行列表中的第一台 Worker；其余角色仅保存配置，尚不参与调度。");
+            for role in connection_settings::WorkerRole::ALL {
+                let label = role.label();
+                let Some(index) = self.configured_workers.iter().position(|worker| worker.role == role) else { continue; };
+                egui::Frame::group(ui.style()).inner_margin(6).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("角色：{label}"));
+                        if ui.small_button("移除").clicked() { self.configured_workers.remove(index); }
+                    });
+                    let worker = &mut self.configured_workers[index];
+                    ui.horizontal(|ui| {
+                        ui.label("IP");
+                        ui.text_edit_singleline(&mut worker.host);
+                        ui.small("例如 192.168.1.20");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("账号");
+                        ui.text_edit_singleline(&mut worker.username);
+                        ui.small("通常为 root");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("密码");
+                        Self::password_text_edit_with_copy(ui, &mut worker.password);
+                        ui.small("明文保存；不写入日志或回执");
+                    });
+                });
+            }
+            let addable: Vec<_> = connection_settings::WorkerRole::ALL.iter()
+                .copied().filter(|role| !self.configured_workers.iter().any(|worker| worker.role == *role)).collect();
+            if addable.is_empty() {
+                ui.small("四个角色已全部配置；如需更换，请先移除对应角色。");
+            } else {
+                ui.horizontal(|ui| {
+                    if ui.button("＋ 添加 Worker").clicked() {
+                        self.configured_workers.push(connection_settings::ConfiguredWorker {
+                            id: format!("worker-{}", addable[0].as_str()), role: addable[0],
+                            host: String::new(), username: "root".into(), password: String::new(),
+                        });
+                    }
+                    ui.small(format!("下一个可添加角色：{}", addable[0].label()));
+                });
+            }            ui.small("Windows 只负责控制和显示；任务负载、模型调用和资源门禁在 Linux Worker 上执行。");
             });
             ui.separator();
             let ready = !self.pending.contains("worker-provision");
             if ui.add_enabled(ready, egui::Button::new("保存配置")).clicked() { self.save_connection_settings(); }
             if ui.add_enabled(ready, egui::Button::new(if self.pending.contains("worker-provision") { "正在准备 Worker（等待回执）" } else { "自动准备并连接 Worker" })).clicked() {
+                let Some(worker) = self.configured_workers.first() else {
+                    self.onboarding_input_error = Some("至少配置一台 Worker".into());
+                    return;
+                };
                 let request = ProvisionRequest {
-                    host: self.onboarding_host.trim().into(),
-                    root_user: self.onboarding_root_user.trim().into(),
-                    root_password: self.onboarding_root_password.as_bytes().to_vec(),
+                    host: worker.host.trim().into(),
+                    root_user: worker.username.trim().into(),
+                    root_password: worker.password.as_bytes().to_vec(),
                     model_base_url: self.onboarding_model_base_url.trim().into(),
                     model_token: self.onboarding_model_token.as_bytes().to_vec(),
                     model: self.onboarding_model.trim().into(),
@@ -735,7 +831,7 @@ impl Workbench {
                         self.onboarding_failure = None;
                         self.onboarding_reprepare_requested = false;
                         self.send("worker-provision".into(), UiCommand::ProvisionWorker { request });
-                        self.onboarding_root_password.clear();
+                        for worker in &mut self.configured_workers { worker.password.clear(); }
                         self.onboarding_model_token.clear();
                     }
                     Err(error) => self.onboarding_input_error = Some(onboarding_input_error_copy(&error)),

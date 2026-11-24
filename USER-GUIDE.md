@@ -39,11 +39,11 @@ Windows Manager（原生 GUI）          Linux Worker（172.28.8.221，示例部
 
 1. 解压 ZIP 到任意本地目录（无需安装器；SmartScreen 警告见 §9）。
 2. 保留完整解压目录，不要只复制 exe，也不要用其他版本的文件拼接。`agentranch.exe` 与 `aw-cli.exe` 同目录；真实 Worker 准备还需要随包的 `tools/paramiko_provision.py`、`tools/paramiko_gateway.py`、`runtime/python/` 和 `tools/` 下已审核的资产清单、known_hosts、TLS 证书。仅含 exe/DLL 的界面验收目录不是可连接 Worker 的完整程序包。
-3. 双击 `agentranch.exe`（local 模式，受控 fixture），或在终端：
+3. 双击 `agentranch.exe`（默认 real 模式，首次打开连接设置窗口），或在终端：
 
 ```powershell
-.\agentranch.exe                        # local 模式
-.\agentranch.exe --real                 # real 模式
+.\agentranch.exe                        # 默认 real 模式（双击同此）
+.\agentranch.exe --local                # 显式 local 模式（本地诊断，受控 fixture）
 .\agentranch.exe --real --state-dir "D:\ao-state\real-221"
 ```
 
@@ -51,23 +51,36 @@ Windows Manager（原生 GUI）          Linux Worker（172.28.8.221，示例部
 - 默认状态目录：local `%LOCALAPPDATA%\agentranch\local`，real `...\real`。
 - **local/real 状态身份不同，不要复用账本**；状态目录含 SQLite/锁/身份文件，处理故障先备份。
 
-## 4. 快速上手：六项输入到真实结果页面（real 模式）
+## 4. 快速上手：模型配置 + Worker 配置机到真实结果页面（real 模式）
 
-普通项目页只显示三段主路径（①新建项目 → ②定稿设计 → ③提交项目）；"现在做："一行直接告诉你下一步点哪里；出现 ⚠ 需要处理 卡片时先按它的说明处理。任务拆分、手动开发、独立测试、返修和人工验收属于“高级 · 本地诊断”，不属于六字段 onboarding 的普通 real-mode 主路径。
+普通项目页只显示三段主路径（①新建项目 → ②定稿设计 → ③提交项目）；"现在做："一行直接告诉你下一步点哪里；出现 ⚠ 需要处理 卡片时先按它的说明处理。任务拆分、手动开发、独立测试、返修和人工验收属于“高级 · 本地诊断”，不属于普通 real-mode 主路径。
 
-主页面优先显示项目流程，然后是“模型实时输出（SSE）”；Worker 只保留紧凑状态和“连接设置”入口。点击“连接设置”，在弹窗内填写六项：
+主页面优先显示项目流程，然后是“模型实时输出（SSE）”；Worker 只保留紧凑状态和“连接设置”入口。首次以 real 模式启动时会自动打开一次设置；之后点“连接设置”随时打开。弹窗分两个独立区域：
 
-1. Linux Worker IP；
-2. root 账号；
-3. root 密码；
-4. 模型服务地址（第三方模型 HTTPS origin，不带路径；中性标签不表示新增供应商协议支持）；
-5. API key；
-6. 默认模型。
+**模型配置（3 项）**
 
-- **保存配置**只保存本机设置，不启动 SSH、Worker 或模型：IP、root 账号、服务地址、模型保存在当前状态目录的 `worker-settings.json`；API key（最多 2560 UTF-8 字节）保存在同一 Windows 用户、本机的 Windows 凭据管理器中，不进入普通 JSON。root 密码永不保存。
-- 关闭弹窗可回到流程；重开程序会恢复保存配置，仍需输入本次 root 密码并完成当前会话认证。保存或恢复配置不代表 Worker 已连接。
-- 已保存的 API key 缺失、无效或 Windows 凭据管理器读取失败时，只要普通配置文件的版本、字段、状态目录及服务地址绑定校验通过，四项普通配置仍会恢复；API key 留空并提示重新输入和保存，root 密码仍需本次填写。恢复不会自动连接或提交任务。配置文件本身损坏、越界或绑定不符时不会部分恢复，也不会读取其凭据引用。
-- 更改服务地址会清空已恢复的 API key，需为新地址重新填写；重开弹窗不会覆盖未保存的普通字段。同地址凭据后来可读时可恢复 key 并更新提示，仍不代表当前会话已认证。保存/读取失败会明确提示，不退回明文保存。小窗口内表单可滚动，保存、准备、关闭按钮在表单之外。
+1. 模型服务地址（第三方模型 HTTPS origin，不带路径；中性标签不表示新增供应商协议支持）；
+2. API key；
+3. 默认模型。
+
+**Worker 配置机（按角色，四台）**
+
+角色固定为拆分 → 开发 → 测试 → 审查，四台各一台，每台三项（IP、账号、密码）：
+
+1. IP（IPv4）；
+2. 账号（通常为 root）；
+3. 密码。
+
+新建工作台默认带一台“拆分”Worker 的空表单；点“＋ 添加 Worker”按拆分 → 开发 → 测试 → 审查的顺序追加下一台，四个角色都配置后按钮不再可加。每台右侧的“移除”可删掉该角色，重新空出该角色再添加。
+
+> **当前版本边界**：只有列表中的第一台 Worker 会被连接并执行任务；其余角色仅保存配置，尚未参与调度。四角色按阶段自动流转属于后续版本能力，不要据此判断“四台已在协作”。
+
+- **全部信息明文保存在本机配置文件**：模型配置与 Worker 列表（含 API key、每台 Worker 密码）都写入当前状态目录的 `connection-settings.json`，不使用 Windows 凭据管理器。这是个人自用场景的显式取舍：配置文件本身不加密。
+- **凭据边界不变**：明文仅限本机配置文件；运行日志、操作回执、诊断包、源码中仍不出现密码或 API key。
+- 关闭弹窗会清空本会话内存中的密码与 API key，但**已保存的明文配置仍在磁盘上**，重开程序会完整恢复。保存或恢复配置不代表 Worker 已连接。
+- 更改服务地址会清空已恢复的 API key，需为新地址重新填写；重开弹窗不会覆盖未保存的普通字段。保存/读取失败会明确提示，不会静默退回默认值。小窗口内表单可滚动，保存、准备、关闭按钮在表单之外。
+- 配置文件损坏或格式不支持时不会部分恢复、也不会被自动覆盖，界面直接提示“本机连接配置损坏”；此时显式填写并“保存配置”才会替换它。
+- 校验规则：至少一台 Worker；同一角色只能出现一次；Worker `id` 与 IP 不得重复；密码与 API key 非空且有长度上限。
 
 点“自动准备并连接 Worker”会先保存配置；保存失败时不发起准备。随后 Manager/随包 Helper 会自动完成 root 身份验证、普通 Linux 用户发现、目标用户 home/`.ssh`/`authorized_keys` 初始化、公钥追加安装、Worker/loader 上传、配置生成、资产与远端身份预检，并在本次 Manager 状态目录内激活生成的连接。缺失路径会自动创建；这三个对象的 owner/必要权限会自动修复，保留已有公钥，不递归改动用户文件。不需要手工 chmod/chown。非正规文件、符号链接或其他普通用户拥有的路径仍会阻断；SSH/TLS 校验不变。普通用户不需要选择或编辑 `gateway.json`。
 
@@ -75,7 +88,7 @@ Windows Manager（原生 GUI）          Linux Worker（172.28.8.221，示例部
 
 下面是产品操作顺序；本仓库的 local/fixture 回归不证明真实跨主机 onboarding、真实模型调用或生产 readiness：
 
-1. **连接 Worker**：填写上面的六项，点击自动准备；Windows 只负责控制和显示，任务、模型调用与资源门禁在 Linux Worker 上执行。
+1. **连接 Worker**：填写上面的模型配置与至少一台 Worker（按角色可配到四台），点击自动准备；Windows 只负责控制和显示，任务、模型调用与资源门禁在 Linux Worker 上执行。
 2. **创建项目**：GUI 内新建项目；onboarding 成功不会自动创建空项目。
 3. **导入设计文档**：UTF-8 `.md`/`.txt`，上限 256 KiB。检查显示的版本 U、文件名、完整文本、小写 SHA-256，确认无误后点"确认此上传版本"。版本/哈希过期时确认会被拒绝。
 4. **提交项目**：确认设计文档后，普通 real-mode 用户直接点击“提交项目”。只有当前 Manager 会话的自动准备、生成 Gateway、本地激活和远端 preflight 门禁都存在时才允许提交；“Worker 已连接，可提交项目”不等于模型或业务结果已完成。顶部状态与普通页按钮共用当前快照的就绪判断：准备或提交待回执、已有执行中/UNKNOWN 项目、当前凭据不可用、预检未通过或名额占用都会阻止新提交，并在页面说明原因；旧的已准入结果不会盖过另一任务的阻塞状态。名额占用时应查看现有任务和回执，不是反复准备 Worker、手动释放或自动重跑。
@@ -145,7 +158,7 @@ real 模式需要受信任配置提供网关与 Worker 依赖。已验证部署�
 - **Worker 配置**（`native-worker-config/1`）：cgroup_root_mode（explicit / current-unit）、expected_worker_timeout_secs 等；字段校验规则见 `packaging/ssh-loader-path.txt`。
 - **准入链**：worker ELF 身份 → signed start → 原生 owner-exec（cgroup 隔离）→ signed terminal evidence → Store admission → assignment 释放。传输层退出码/算术超时不释放槽位，Store 只认完整签名原生终态证据。
 - **模型端点**：进程内调用，TLS 证书锁定（cert pinning），不落盘、不进 argv/日志。
-- **秘密边界**：root 密码不保存；用户保存的 API key 仅由 Windows 凭据管理器持久化。准备 Worker 时，root 密码与 API key 通过有界 `AW-WORKER-ONBOARDING/1` 帧协议经 stdin 在内存传递；普通用户 SSH 私钥由 Helper 生成并只经结果管道交给 Manager，不落普通文件。模型 token 不进入 gateway.json、数据库、evidence 或日志。
+- **秘密边界**：本机 `connection-settings.json` 为明文存储（含 API key 与每台 Worker 密码），这是个人自用场景的显式取舍，不加密、不依赖 Windows 凭据管理器。该明文仅限本机配置文件；运行日志、操作回执、诊断包、源码中仍不出现密码或 API key。准备 Worker 时，账号密码与 API key 通过有界 `AW-WORKER-ONBOARDING/1` 帧协议经 stdin 在内存传递；普通用户 SSH 私钥由 Helper 生成并只经结果管道交给 Manager，不落普通文件。模型 token 不进入 gateway.json、数据库、evidence 或日志。
 
 ## 7. 可观测性与验收证据
 
@@ -168,7 +181,7 @@ real 模式需要受信任配置提供网关与 Worker 依赖。已验证部署�
 - 不要把历史报告/旧 attempt/旧审批当当前执行证明。
 - 关闭 GUI 只停本地工作台，不等于远端任务已取消。
 - SSH：Paramiko RejectPolicy + 安装者提供的固定 known_hosts，不弱化、不 TOFU、不猜 key；禁止从旧日志恢复秘密。
-- root 密码、普通用户私钥只在受控内存/二进制管道中流转；API key 可由 Windows 凭据管理器按当前用户/本机保存，其他传递仍走受控内存/管道；模型 token 绝不进普通配置、签名 envelope/gateway.json/数据库/evidence/日志。凭据管理器不隔离同一用户权限下的恶意程序，不能替代当前会话认证。
+- root 密码、普通用户私钥只在受控内存/二进制管道中流转；API key 与 Worker 密码按上面的显式取舍明文保存在本机 `connection-settings.json`，其他传递仍走受控内存/管道；模型 token 绝不进签名 envelope/gateway.json/数据库/evidence/日志。明文配置不加密，不能替代当前会话认证，也不隔离同一用户权限下的恶意程序。
 - 未配置、未实现、执行失败、证据未建立是不同状态；按阻塞原因处理，不伪装成功。
 - 已验证场景之外（其他主机/用户/模型端点/平台）一律视为未验证。
 

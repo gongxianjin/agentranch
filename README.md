@@ -1,6 +1,6 @@
 # AgentRanch
 
-**把"定稿设计文档"变成"已验收交付物"的本地工作台**：原生 Rust + egui 的 Windows 管理器 + Linux agent-worker。设计文档导入 → 任务拆分 → 逐项审核 → 手动开发 → 独立测试 → 人工验收，每一步都有显式门槛和可追溯证据，绝不把"看起来完成了"当作"完成了"。
+**把"定稿设计文档"变成"已验收交付物"的本地工作台**：原生 Rust + egui 的 Windows 管理器 + Linux agent-worker。设计文档导入 → 任务拆分 → 逐项审核 → 开发 → 测试 → 验收，每一步都有显式门槛和可追溯证据，绝不把"看起来完成了"当作"完成了"。
 
 ```
 ┌────────────────────── Windows ──────────────────────┐   ┌──── Linux B ────┐
@@ -11,30 +11,47 @@
 └──────────────────────────────────────────────────────┘
 ```
 
+## 在你用之前，先知道它是什么水平
+
+这个项目很年轻（2026-10 建库、单作者、无 star）。它不假装成熟：下面这张表是每一项能力的真实验证状态，README 里的每个"已完成"都有本地测试背书，每个没跑通的都明说。
+
+| 能力 | 状态 |
+|---|---|
+| 14 阶段工作流 + SQLite 账本 + 人工门控 | ✅ 已验证（本地 headless 测试 + 真实 GUI pointer 测试） |
+| 双击默认进入 real 模式、首次打开连接设置 | ✅ 已验证（GUI 测试） |
+| 模型配置 + 四角色 Worker 明文保存/重启恢复 | ✅ 已验证（`rust_connection_settings` 8/8） |
+| CLI（`check`/`mcp`/`local-check`/`runner`/`controller`） | ✅ 已验证（本地） |
+| 多 Worker 四角色协作派工（拆分→开发→测试→审查） | 🚧 建设中：角色配置已落地，流水线派工未实现 |
+| 外部模型连接与真实执行 | 🚧 建设中（NOT_RUN，见[当前明确未覆盖](#当前明确未覆盖)） |
+| 远程退出/取消证据 | 🚧 建设中（NOT_RUN） |
+| 签名 / installer / Windows 原生窗口验收 | ❌ 未做（NOT_RUN） |
+
 ## 30 秒开始
 
 1. 从 [Releases](https://github.com/gongxianjin/agentranch/releases) 下载 zip，解压到任意目录（**不要**装进 Program Files）。
-2. 双击 `agentranch.exe`（首次会有 SmartScreen 提示，见下方 FAQ——包未签名是预期）。
-3. 左侧输入项目名 → 新建项目 → 导入一份**已定稿**的 UTF-8 `.md`/`.txt` 设计文档 → 核对 SHA-256 → 确认版本 → 按界面引导走完流程。
+2. 双击 `agentranch.exe`（首次会有 SmartScreen 提示，见下方 FAQ——包未签名是预期）。**双击即 real 模式**；首次打开会弹出连接设置窗口。
+3. 在连接设置里填模型配置（地址 / API key / 模型名）和至少一台 Worker（详见[连接设置](#连接设置模型与-worker-机)）。
+4. 左侧输入项目名 → 新建项目 → 导入一份**已定稿**的 UTF-8 `.md`/`.txt` 设计文档 → 核对 SHA-256 → 确认版本 → 按界面引导走完流程。
 
 CLI 入口：`aw-cli.exe --help`（`check` / `mcp` / `local-check` / `runner` / `controller`）。
 
-> ⚠️ 当前版本边界（诚实声明）：拆分/开发/测试需要连接真实执行主机；未配置时按钮会以人话告诉你差什么、怎么补。外部 AO/Reason/模型链路、远程退出证据仍在建设中，详见[当前明确未覆盖](#当前明确未覆盖)。
-
 ## 为什么是 AgentRanch
+
+AI 编码助手最危险的不是写不出代码，而是把"看起来完成了"交付给你。AgentRanch 的整个设计围绕一件事：**让每个"完成"都有独立于 AI 自述的证据**。
 
 - **证据优先**：每个动作落 SQLite 账本；"已接受请求"≠"已执行"，"测试通过"≠"验收通过"，阶段与证据一一对应。
 - **显式门控**：全部 14 个阶段（①新建 → ✓已验收）都有人工确认点；驳回必须写原因，返修最多 2 轮，验收必须亲自点。
 - **本地优先**：状态、账本、产物全在本地 `--state-dir`；不匿名上报，不云依赖。
 - **一处入口**：GUI 看进度与证据，CLI 做脚本化/MCP 集成，二者共享同一账本。
+- **诚实失败**：配置缺失、链路未通、执行结果未知（`UNKNOWN`），界面都用人话说清楚差什么，而不是静默降级或假装成功。
 
 ## 快速导航
 
 | 想做什么 | 去哪里 |
 |---|---|
 | 图形界面走完整流程 | [USER-GUIDE.md](USER-GUIDE.md) §快速上手 |
+| 配置模型与 Worker 机 | 本 README [连接设置](#连接设置模型与-worker-机) |
 | CLI/脚本/MCP 集成 | [USER-GUIDE.md](USER-GUIDE.md) §CLI 参考 |
-| 配置 Linux Worker | [USER-GUIDE.md](USER-GUIDE.md) §Linux Worker 配置 |
 | 查看每个阶段的意思 | GUI 项目页"当前阶段"行（①–✓ 编号即顺序） |
 | 理解"被阻塞"怎么办 | 界面 ⚠ 卡片的【现在的情况】/【怎么办】三段式说明 |
 | 验证与证据口径 | 本 README [打包与验收边界](#打包与验收边界) |
@@ -45,14 +62,37 @@ CLI 入口：`aw-cli.exe --help`（`check` / `mcp` / `local-check` / `runner` / 
 在解压后的产品目录中打开 PowerShell 或命令提示符：
 
 ```powershell
-.\agentranch.exe                                  # local 模式（本地诊断）
-.\agentranch.exe --real                           # real 模式（需配置执行依赖）
+.\agentranch.exe                                  # 默认 real 模式（双击同此）
+.\agentranch.exe --local                          # 显式 local 模式（本地诊断）
 .\agentranch.exe --state-dir "D:\state\workbench" # 显式状态目录
 ```
 
+- **双击或无参数 = real 模式**；`--local` 显式进入本地诊断；`--real` 仍被接受（兼容旧脚本）。
+- 启动时**不会**自动准备、连接或提交任何东西——需要你显式操作。
 - `--state-dir` 必须后跟非空路径，不能重复；未知参数会显示启动错误而不是静默忽略。
 - 默认状态目录：local `%LOCALAPPDATA%\agentranch\local`，real `%LOCALAPPDATA%\agentranch\real`。两种模式账本身份不同，不要互换或删除账本绕过错误。
 - 两个 exe（`agentranch.exe` + `aw-cli.exe`）必须同目录同版本；GUI 启动时会校验。
+
+## 连接设置（模型与 Worker 机）
+
+首次打开（或点"连接设置"）会出现设置窗口，分两个独立分区：
+
+**模型配置** — API 地址（HTTPS）、API key、模型名。对外部模型服务的全部请求走这里。
+
+**Worker 配置机** — 每台 Worker 一行：角色、IP、账号、密码。四个固定角色对应一条开发流水线：
+
+| 角色 | 干什么 |
+|---|---|
+| 拆分（split） | 把定稿设计文档拆成可执行任务 |
+| 开发（develop） | 逐任务实现代码 |
+| 测试（test） | 独立运行测试、验证行为 |
+| 审查（review） | 汇总产物、审核证据 |
+
+- 每个角色恰好一台 Worker，用"＋ 添加 Worker"追加；角色、IP、id 均不能重复。
+- 不足四台时可以先配一台跑通链路（后续协作派工需要四台各就位）。
+- 全部配置**明文**保在本机 `%LOCALAPPDATA%\agentranch\real\connection-settings.json`（schema 2，原子写入，重启恢复）——这是个人使用定位的取舍：本机单用户、不加密、不并发。如果这台机器会交给别人用，先删掉这个文件。
+
+> ⚠️ 协作派工（拆分→开发→测试→审查的自动流转）仍在建设中；当前版本的角色配置已就位，流水线执行未实现。
 
 ## CLI 子命令
 
@@ -73,8 +113,8 @@ CLI 入口：`aw-cli.exe --help`（`check` / `mcp` / `local-check` / `runner` / 
 
 ## local 与 real 的区别
 
-- **local**：随 Rust 核心内置的受控 fixture，用于熟悉界面/检查状态目录/SQLite/受管进程，明确标记模拟，不代表真实执行。
-- **real**：显式真实模式。配置缺失不会静默回退 local；需要受信任配置提供 AO/Reason/节点依赖，由实际运行与退出证据证明链路可用。仅配置文件存在、`check` 通过、按钮可点都不等于真实执行完成。
+- **local**（`--local` 显式进入）：随 Rust 核心内置的受控 fixture，用于熟悉界面/检查状态目录/SQLite/受管进程，明确标记模拟，不代表真实执行。
+- **real**（默认）：显式真实模式。配置缺失不会静默回退 local；需要模型与 Worker 配置就位，由实际运行与退出证据证明链路可用。仅配置文件存在、`check` 通过、按钮可点都不等于真实执行完成。
 
 ## 常见问题（FAQ）
 
@@ -88,6 +128,8 @@ CLI 入口：`aw-cli.exe --help`（`check` / `mcp` / `local-check` / `runner` / 
 
 **"拆分任务"点了没反应？** — 先看按钮下 ⚠ 卡片：未配置执行主机会明确告知三步操作；已配置但链路未打通会说明这是版本能力边界，不是操作问题。
 
+**密码和 API key 是明文存的？** — 是，见[连接设置](#连接设置模型与-worker-机)。个人单机使用的定位；共享机器前请删除 `connection-settings.json`。
+
 ## Windows 开发构建：使用已安装 SQLite
 
 不启用 `rusqlite/bundled`、不编译 `sqlite3.c`；使用本机已安装的 x64 MinGW SQLite（当前环境 `C:\msys64\mingw64`，SQLite 3.52.0；最低 3.45.3）：
@@ -99,7 +141,7 @@ CLI 入口：`aw-cli.exe --help`（`check` / `mcp` / `local-check` / `runner` / 
 
 入口只为子进程设置 MinGW-first PATH、固定 Rust 1.99.1、`SQLITE3_INCLUDE_DIR`/`SQLITE3_LIB_DIR`、`SQLITE3_STATIC=0`、`SQLITE3_NO_PKG_CONFIG=1`，不改全局环境、不下载安装。Windows 包必须经 PE import 递归收集器携带 SQLite DLL 及实际依赖；打包成功不等于运行验收通过。其他平台需本地可链接 SQLite；不声明 Linux 构建已验证。
 
-一键回归（Rust 388 + Python 119，约 3–4 分钟）：
+一键回归（Rust + Python 全量，约 3–4 分钟）：
 
 ```powershell
 py -3 -I .test-scripts\local\run_regression.py
@@ -113,7 +155,11 @@ py -3 -I .test-scripts\local\run_regression.py
 
 ## 当前明确未覆盖
 
-以下边界标为 `NOT_RUN`：外部 AO/Reason/模型连接与真实执行、真实项目开发、远程退出/取消、Windows native window acceptance、签名/installer、Stop10 及其他未实际运行的 gate。已运行验证限于本地 headless Rust/SQLite、真实 GUI pointer action、本地 service/ledger、synthetic ingress、独立 `ExitProof` 与 managed-artifact 状态投影；这些结果不证明外部执行或真实产品包已验收。
+以下边界标为 `NOT_RUN`：外部模型连接与真实执行、真实项目开发、多 Worker 协作派工、远程退出/取消、Windows native window acceptance、签名/installer、Stop10 及其他未实际运行的 gate。已运行验证限于本地 headless Rust/SQLite、真实 GUI pointer action、本地 service/ledger、synthetic ingress、独立 `ExitProof` 与 managed-artifact 状态投影、连接设置明文持久化；这些结果不证明外部执行或真实产品包已验收。
+
+## License
+
+[MIT](LICENSE)
 
 ---
 

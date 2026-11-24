@@ -242,6 +242,11 @@ fn app(state: &Path) -> (desktop::Workbench, egui::Context) {
         &ctx,
     ).unwrap();
     ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.0);
+    // First real-mode launch opens the settings modal by design; dismiss it so
+    // the workflow navigation underneath is reachable.
+    if app.onboarding_form_open_for_test() {
+        click_text(&mut app, &ctx, "关闭设置");
+    }
     // These tests exercise the legacy six-step project wizard. Reach it through
     // the same visible advanced navigation a user must use; do not toggle the
     // private diagnostics flag as a test-only shortcut.

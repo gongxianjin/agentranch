@@ -55,7 +55,7 @@ fn onboarding_validation_errors_map_to_safe_field_guidance() {
     };
     let host_error = validate_provision_input(&invalid_host).unwrap_err();
     let host_copy = desktop::onboarding_input_error_copy(&host_error);
-    assert!(host_copy.contains("Linux 工作节点 IP"));
+    assert!(host_copy.contains("Worker IP"));
     assert!(host_copy.contains("IPv4"));
 
     for base_url in ["http://model.example", "https://model.example/v1", "https://:8443"] {
@@ -84,7 +84,7 @@ fn onboarding_validation_errors_map_to_safe_field_guidance() {
     let password_copy = desktop::onboarding_input_error_copy(
         &validate_provision_input(&missing_password).unwrap_err(),
     );
-    assert!(password_copy.contains("root 密码"));
+    assert!(password_copy.contains("Worker 密码"));
 
     let missing_token = ProvisionRequest {
         host: "192.0.2.10".into(),
@@ -122,7 +122,7 @@ fn onboarding_validation_errors_map_to_safe_field_guidance() {
 fn unknown_onboarding_validation_errors_use_generic_safe_copy() {
     let error = anyhow::anyhow!("secret diagnostic synthetic-password synthetic-token");
     let copy = desktop::onboarding_input_error_copy(&error);
-    assert_eq!(copy, "输入未通过校验，请检查六项信息后重试");
+    assert_eq!(copy, "输入未通过校验，请检查模型配置与 Worker 列表后重试");
     assert!(!copy.contains("synthetic-password"));
     assert!(!copy.contains("synthetic-token"));
 }

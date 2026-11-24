@@ -39,6 +39,39 @@ fn parse(root: &Path, args: impl IntoIterator<Item = &'static str>) -> anyhow::R
 }
 
 #[test]
+fn double_click_defaults_to_real_mode_without_running_a_fixture() {
+    let root = tempfile::tempdir().unwrap();
+    let opts = parse(root.path(), [])
+        .unwrap_or_else(|error| panic!("double-click launch must enter real mode: {error}"));
+    assert_eq!(opts.mode, Mode::Real);
+    assert_eq!(opts.state_dir, root.path().join("data/agentranch/real"));
+    assert!(!root.path().join(worker_name()).exists());
+}
+
+#[test]
+fn local_mode_is_explicit_and_uses_local_state_directory() {
+    let root = tempfile::tempdir().unwrap();
+    install_matching_worker(root.path());
+    let opts = parse(root.path(), ["--local"]).unwrap();
+    assert_eq!(opts.mode, Mode::Local);
+    assert_eq!(opts.state_dir, root.path().join("data/agentranch/local"));
+}
+
+#[test]
+fn real_and_local_modes_cannot_be_combined() {
+    let root = tempfile::tempdir().unwrap();
+    let error = parse(root.path(), ["--real", "--local"]).unwrap_err();
+    assert!(error.to_string().contains("duplicate") || error.to_string().contains("mutually"));
+}
+
+#[test]
+fn gateway_key_stdin_is_rejected_in_explicit_local_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let error = parse(root.path(), ["--local", "--gateway-key-stdin"]).unwrap_err();
+    assert!(error.to_string().contains("--gateway-key-stdin requires --real"));
+}
+
+#[test]
 fn gateway_key_stdin_is_an_explicit_real_mode_launch_flag() {
     let root = tempfile::tempdir().unwrap();
     let opts = parse(root.path(), ["--real", "--gateway-key-stdin"]).unwrap();
@@ -47,10 +80,11 @@ fn gateway_key_stdin_is_an_explicit_real_mode_launch_flag() {
 }
 
 #[test]
-fn gateway_key_stdin_is_rejected_without_real_mode() {
+fn gateway_key_stdin_uses_the_default_real_mode() {
     let root = tempfile::tempdir().unwrap();
-    let error = parse(root.path(), ["--gateway-key-stdin"]).unwrap_err();
-    assert!(error.to_string().contains("--gateway-key-stdin requires --real"));
+    let opts = parse(root.path(), ["--gateway-key-stdin"]).unwrap();
+    assert_eq!(opts.mode, Mode::Real);
+    assert!(opts.gateway_key_stdin);
 }
 
 #[test]
@@ -61,10 +95,10 @@ fn no_gateway_key_flag_leaves_memory_credential_unconfigured() {
 }
 
 #[test]
-fn missing_sibling_worker_is_rejected_with_deterministic_error() {
+fn explicit_local_mode_requires_a_matching_sibling_worker() {
     let root = tempfile::tempdir().unwrap();
-    let error = match parse(root.path(), []) {
-        Ok(_) => panic!("missing sibling worker must be rejected"),
+    let error = match parse(root.path(), ["--local"]) {
+        Ok(_) => panic!("explicit local mode must require the fixture worker"),
         Err(error) => error,
     };
     assert_eq!(error.to_string(), "sibling worker executable is missing");
@@ -74,7 +108,7 @@ fn missing_sibling_worker_is_rejected_with_deterministic_error() {
 fn wrong_worker_version_is_rejected() {
     let root = tempfile::tempdir().unwrap();
     install_fake_worker(root.path(), env!("CARGO_PKG_NAME"), "999.999.999");
-    let error = match parse(root.path(), []) {
+    let error = match parse(root.path(), ["--local"]) {
         Ok(_) => panic!("wrong worker version must be rejected"),
         Err(error) => error,
     };
@@ -85,7 +119,7 @@ fn wrong_worker_version_is_rejected() {
 fn wrong_worker_package_identity_is_rejected() {
     let root = tempfile::tempdir().unwrap();
     install_fake_worker(root.path(), "untrusted-package", env!("CARGO_PKG_VERSION"));
-    let error = match parse(root.path(), []) {
+    let error = match parse(root.path(), ["--local"]) {
         Ok(_) => panic!("wrong worker package must be rejected"),
         Err(error) => error,
     };
@@ -96,7 +130,7 @@ fn wrong_worker_package_identity_is_rejected() {
 fn matching_sibling_worker_is_accepted() {
     let root = tempfile::tempdir().unwrap();
     let worker = install_matching_worker(root.path());
-    let opts = parse(root.path(), []).unwrap();
+    let opts = parse(root.path(), ["--local"]).unwrap();
     assert_eq!(opts.mode, Mode::Local);
     assert_eq!(opts.worker_exe, worker);
 }
@@ -151,7 +185,7 @@ fn real_manager_launch_never_executes_a_present_local_fixture_worker() {
 fn default_and_real_modes_keep_isolated_state_defaults() {
     let root = tempfile::tempdir().unwrap();
     install_matching_worker(root.path());
-    let local = parse(root.path(), []).unwrap();
+    let local = parse(root.path(), ["--local"]).unwrap();
     let real = parse(root.path(), ["--real"]).unwrap();
     assert_eq!(local.state_dir, root.path().join("data/agentranch/local"));
     assert_eq!(real.mode, Mode::Real);
@@ -162,7 +196,7 @@ fn default_and_real_modes_keep_isolated_state_defaults() {
 fn explicit_host_state_path_is_preserved_without_executable_or_shell_override() {
     let root = tempfile::tempdir().unwrap();
     let worker = install_matching_worker(root.path());
-    let opts = parse(root.path(), ["--state-dir", "D:/isolated/local ledger"]).unwrap();
+    let opts = parse(root.path(), ["--local", "--state-dir", "D:/isolated/local ledger"]).unwrap();
     assert_eq!(opts.state_dir, Path::new("D:/isolated/local ledger"));
     assert_eq!(opts.mode, Mode::Local);
     assert_eq!(opts.worker_exe, worker);

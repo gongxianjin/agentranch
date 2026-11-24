@@ -30,6 +30,11 @@ fn recovered_pending_exit(state: &Path) -> (desktop::Workbench, egui::Context, S
     let mut app = desktop::Workbench::new(ServiceOptions { mode: Mode::Real, state_dir: state.into(), worker_exe: env!("CARGO_BIN_EXE_aw-cli").into(), gateway_key: None, gateway_model_token: None }, &ctx).unwrap();
     ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.0);
     wait(&mut app, |s| s.projects.len() == 1);
+    // First real-mode launch opens the settings modal by design; dismiss it so
+    // the workflow navigation underneath is reachable.
+    if app.onboarding_form_open_for_test() {
+        click_text(&mut app, &ctx, "关闭设置");
+    }
     // Review controls belong to the advanced local-diagnostics project wizard.
     // Reach them through the same visible navigation as a user; do not bypass
     // the product entry point by toggling private Workbench flags.

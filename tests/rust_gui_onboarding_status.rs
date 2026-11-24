@@ -45,6 +45,15 @@ fn open_settings(app: &mut desktop::Workbench, context: &egui::Context) {
     for _ in 0..3 { frame(app, context, vec![]); }
 }
 
+/// A fresh real-mode workbench opens its settings on first launch by design.
+/// Tests that assert the workflow is *not* covered must dismiss it first.
+fn dismiss_first_launch_settings(app: &mut desktop::Workbench, context: &egui::Context) {
+    if !app.onboarding_form_open_for_test() { return; }
+    for _ in 0..3 { frame(app, context, vec![]); }
+    click_label(app, context, "关闭设置");
+    for _ in 0..3 { frame(app, context, vec![]); }
+}
+
 fn label_center(shape: &egui::epaint::Shape, label: &str) -> Option<egui::Pos2> {
     match shape {
         egui::epaint::Shape::Text(value) if value.galley.job.text == label => Some(value.pos + value.galley.size() / 2.),
@@ -66,23 +75,29 @@ fn click_label(app: &mut desktop::Workbench, context: &egui::Context, label: &st
 }
 
 #[test]
-fn connection_settings_open_only_on_request_and_stay_closed_after_dismissal() {
+fn first_real_workbench_opens_settings_with_model_and_worker_sections_without_starting_work() {
     let context = egui::Context::default();
-    let mut workbench = app(&context);
+    let root = tempfile::tempdir().unwrap();
+    let mut workbench = desktop::Workbench::new_with_provisioner(ServiceOptions {
+        mode: Mode::Real, state_dir: root.path().join("ui"), worker_exe: "unused.exe".into(),
+        gateway_key: None, gateway_model_token: None,
+    }, &context, Box::new(MissingHelperProvisioner)).unwrap();
     let initial = rendered(&mut workbench, &context);
-    assert!(initial.contains("连接设置"));
-    assert!(!initial.contains("Linux 工作节点 IP"), "configuration must not occupy workflow: {initial}");
-    assert!(initial.contains("模型实时输出（SSE）"));
-    click_label(&mut workbench, &context, "连接设置");
-    for _ in 0..3 { frame(&mut workbench, &context, vec![]); }
-    let opened = rendered(&mut workbench, &context);
-    for label in ["Linux 工作节点 IP", "root 账号", "root 密码", "API key", "默认模型"] {
-        assert!(opened.contains(label), "missing modal field: {label}");
+    for label in ["模型配置", "模型服务地址", "API key", "默认模型", "Worker 配置机"] {
+        assert!(initial.contains(label), "first launch must display {label}: {initial}");
     }
-    click_label(&mut workbench, &context, "关闭设置");
-    for _ in 0..3 { frame(&mut workbench, &context, vec![]); }
-    assert!(!rendered(&mut workbench, &context).contains("Linux 工作节点 IP"));
     assert_eq!(workbench.pending_count(), 0);
+    assert_eq!(workbench.receipt_count(), 0);
+    assert!(workbench.snapshot().runs.is_empty());
+    assert!(workbench.snapshot().gateway.is_none());
+    click_label(&mut workbench, &context, "关闭设置");
+    assert!(!rendered(&mut workbench, &context).contains("Worker 配置机"));
+    click_label(&mut workbench, &context, "连接设置");
+    assert!(rendered(&mut workbench, &context).contains("Worker 配置机"));
+    click_label(&mut workbench, &context, "关闭设置");
+    assert!(!rendered(&mut workbench, &context).contains("Worker 配置机"));
+    assert_eq!(workbench.pending_count(), 0);
+    assert_eq!(workbench.receipt_count(), 0);
     assert!(workbench.snapshot().gateway.is_none());
 }
 
@@ -101,6 +116,75 @@ fn status_clarity_connection_modal_does_not_claim_a_specific_provider() {
     assert!(text.contains("test-model"));
     assert_eq!(workbench.pending_count(), 0);
     assert!(workbench.snapshot().gateway.is_none());
+}
+
+#[test]
+fn appending_a_worker_adds_the_next_role_and_persists_all_configured_roles() {
+    use desktop::connection_settings::WorkerRole;
+    let context = egui::Context::default();
+    let mut workbench = app(&context);
+    open_settings(&mut workbench, &context);
+    // A fresh workbench starts with exactly one (split) worker slot.
+    assert_eq!(workbench.configured_workers_for_test().len(), 1, "fresh settings must offer one configurable role");
+    assert!(rendered(&mut workbench, &context).contains("＋ 添加 Worker"), "add control missing");
+    // The add button appends the next role in pipeline order, and the modal must
+    // stay open across the click (an added worker must not dismiss the form).
+    click_label(&mut workbench, &context, "＋ 添加 Worker");
+    let after_add = rendered(&mut workbench, &context);
+    assert!(after_add.contains("Worker 配置机"), "adding a worker must not close the settings modal: {after_add}");
+    let roles: Vec<_> = workbench.configured_workers_for_test().into_iter().map(|(role, ..)| role).collect();
+    assert_eq!(roles, vec![WorkerRole::Split, WorkerRole::Develop], "add must append the next pipeline role");
+    // With every role present the add affordance has nothing left to offer.
+    workbench.set_configured_workers_for_test(["192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.13"], "synthetic-pass");
+    assert!(workbench.addable_roles_for_test().is_empty(), "all four roles configured must close the add affordance");
+    let text = rendered(&mut workbench, &context);
+    assert!(!text.contains("下一个可添加角色"), "all roles configured must close the add affordance: {text}");
+}
+
+// The settings UI must not imply that all configured roles are already being
+// driven; only the first worker is connected in this version.
+#[test]
+fn settings_disclose_that_only_the_first_worker_is_connected() {
+    let context = egui::Context::default();
+    let mut workbench = app(&context);
+    workbench.set_configured_workers_for_test(["192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.13"], "synthetic-pass");
+    open_settings(&mut workbench, &context);
+    let text = rendered(&mut workbench, &context);
+    assert!(text.contains("只连接并执行列表中的第一台 Worker"), "single-worker execution limit must be disclosed: {text}");
+}
+
+#[test]
+fn four_configured_roles_round_trip_through_plaintext_save_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let make = |context: &egui::Context| desktop::Workbench::new(ServiceOptions {
+        mode: Mode::Real, state_dir: root.path().join("ui"), worker_exe: "unused.exe".into(), gateway_key: None, gateway_model_token: None,
+    }, context).unwrap();
+    let context = egui::Context::default();
+    let mut first = make(&context);
+    open_settings(&mut first, &context);
+    // Build all four role slots, then fill each through the real pointer path.
+    for _ in 0..3 { click_label(&mut first, &context, "＋ 添加 Worker"); }
+    let hosts = ["192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.13"];
+    // Model fields first (they also seed a single worker), then replace the
+    // whole worker list with all four roles.
+    first.set_onboarding_fields_for_test("192.0.2.10", "root", "synthetic-pass", "https://model.example", "synthetic-token", "test-model");
+    first.set_configured_workers_for_test(hosts, "synthetic-pass");
+    click_label(&mut first, &context, "保存配置");
+    assert!(rendered(&mut first, &context).contains("配置已保存"));
+    drop(first);
+
+    let context = egui::Context::default();
+    let mut second = make(&context);
+    open_settings(&mut second, &context);
+    let workers = second.configured_workers_for_test();
+    use desktop::connection_settings::WorkerRole;
+    let roles: Vec<_> = workers.iter().map(|(role, ..)| *role).collect();
+    assert_eq!(roles, vec![WorkerRole::Split, WorkerRole::Develop, WorkerRole::Test, WorkerRole::Review], "all roles must restore");
+    let restored_hosts: Vec<_> = workers.iter().map(|(_, host, ..)| host.as_str()).collect();
+    assert_eq!(restored_hosts, hosts, "each role must keep its own host");
+    assert!(workers.iter().all(|(_, _, _, password)| password == "synthetic-pass"), "plaintext config must restore each worker password");
+    assert_eq!(second.pending_count(), 0);
+    assert!(second.snapshot().gateway.is_none(), "restoring config must not claim a connection");
 }
 
 #[test]
@@ -138,7 +222,7 @@ fn project_flow_precedes_sse_on_main_workspace() {
 }
 
 #[test]
-fn save_settings_is_local_only_and_restart_restores_without_root_password() {
+fn save_settings_is_local_only_and_restart_restores_plaintext_credentials() {
     let context = egui::Context::default();
     let mut workbench = app(&context);
     valid_onboarding_fields(&mut workbench);
@@ -148,16 +232,15 @@ fn save_settings_is_local_only_and_restart_restores_without_root_password() {
     assert_eq!(workbench.pending_count(), 0);
     assert!(workbench.snapshot().gateway.is_none());
     click_label(&mut workbench, &context, "关闭设置");
-    assert!(workbench.onboarding_secrets_empty_for_test());
+    assert!(workbench.onboarding_secrets_empty_for_test(), "closing must clear in-memory secrets");
     open_settings(&mut workbench, &context);
     let restored = rendered(&mut workbench, &context);
     assert!(restored.contains("192.0.2.10"));
     assert!(restored.contains("https://model.example"));
-    assert!(!restored.contains("synthetic-token"));
-    // Root password must not be restored; prepare is refused locally.
-    click_label(&mut workbench, &context, "自动准备并连接 Worker");
-    assert!(rendered(&mut workbench, &context).contains("请填写 root 密码"));
-    assert_eq!(workbench.pending_count(), 0);
+    // Plaintext persistence restores the API key with the rest of the config.
+    assert!(!workbench.onboarding_secrets_empty_for_test(), "plaintext config must restore the API key");
+    assert!(!restored.contains("synthetic-token"), "API key must stay masked on screen");
+    assert!(!restored.contains("synthetic-password"));
 }
 
 #[test]
@@ -206,18 +289,19 @@ fn new_workbench_restores_saved_settings_without_claiming_connection() {
     let main = rendered(&mut second, &second_ctx);
     assert!(second.snapshot().gateway.is_none());
     assert!(!main.contains("Worker 已连接，可提交项目"));
-    assert!(!main.contains("Linux 工作节点 IP"));
+    assert!(!main.contains("Worker 配置机"));
     open_settings(&mut second, &second_ctx);
     let restored = rendered(&mut second, &second_ctx);
     assert!(restored.contains("192.0.2.10") && restored.contains("test-model"));
-    click_label(&mut second, &second_ctx, "自动准备并连接 Worker");
-    assert!(rendered(&mut second, &second_ctx).contains("请填写 root 密码"));
+    // The plaintext config restores the client-side password too, but nothing
+    // has been prepared: no Worker is connected just because config exists.
+    assert!(second.snapshot().gateway.is_none());
     assert_eq!(second.pending_count(), 0);
 }
 
-// Catches coupling validated ordinary fields to a missing credential. Only the
-// in-process UI-test Vault is used; a new valid UUID suffix names no old key.
-fn partial_recovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
+// Plaintext persistence has no vault, so "partial recovery" now means: the
+// saved file is unreadable/corrupt and the user must re-enter and re-save.
+fn corrupt_plaintext_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let context = egui::Context::default();
     let mut first = desktop::Workbench::new(ServiceOptions {
@@ -228,19 +312,16 @@ fn partial_recovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>
     click_label(&mut first, &context, "保存配置");
     assert!(rendered(&mut first, &context).contains("配置已保存"));
     drop(first);
-    let path = root.path().join("ui/worker-settings.json");
+    let path = root.path().join("ui/connection-settings.json");
     let original = std::fs::read(&path).unwrap();
-    let mut missing: serde_json::Value = serde_json::from_slice(&original).unwrap();
-    let target = missing["credential_target"].as_str().unwrap();
-    let prefix = target.rsplit_once('/').unwrap().0;
-    missing["credential_target"] = serde_json::json!(format!("{prefix}/{}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
-    (root, path, original)
+    assert!(std::str::from_utf8(&original).unwrap().contains("synthetic-token"), "plaintext file must hold the key");
+    std::fs::write(&path, b"{ corrupt").unwrap();
+    (root, path)
 }
 
 #[test]
-fn partial_recovery_missing_key_restores_fields_without_connection() {
-    let (root, path, _) = partial_recovery_fixture();
+fn corrupt_plaintext_config_is_reported_and_never_silently_replaced() {
+    let (root, path) = corrupt_plaintext_fixture();
     let before = std::fs::read(&path).unwrap();
     let context = egui::Context::default();
     let mut workbench = desktop::Workbench::new(ServiceOptions {
@@ -248,62 +329,37 @@ fn partial_recovery_missing_key_restores_fields_without_connection() {
     }, &context).unwrap();
     open_settings(&mut workbench, &context);
     let text = rendered(&mut workbench, &context);
-    for value in ["192.0.2.10", "root", "https://model.example", "test-model"] {
-        assert!(text.lines().any(|line| line == value), "validated field not restored: {value}; {text}");
-    }
-    assert!(text.contains("四项普通配置已保留") && text.contains("API key 未恢复"));
-    assert!(text.contains("重新输入并保存") && text.contains("不代表 Worker 已连接"));
+    assert!(text.contains("本机连接配置损坏"), "corrupt file must be explained: {text}");
     assert!(workbench.onboarding_secrets_empty_for_test());
     assert!(workbench.snapshot().gateway.is_none());
     click_label(&mut workbench, &context, "自动准备并连接 Worker");
-    assert!(rendered(&mut workbench, &context).contains("请填写 root 密码"));
-    workbench.set_onboarding_fields_for_test("192.0.2.10", "root", "synthetic-password", "https://model.example", "", "test-model");
-    click_label(&mut workbench, &context, "自动准备并连接 Worker");
-    assert!(rendered(&mut workbench, &context).contains("请填写 API key"));
-    assert_eq!(workbench.pending_count(), 0);
-    assert!(workbench.snapshot().gateway.is_none());
-    assert_eq!(std::fs::read(&path).unwrap(), before, "read/invalid prepare must not rewrite saved settings");
-    // Explicit local replacement succeeds, without preparing or persisting root.
-    workbench.set_onboarding_fields_for_test("192.0.2.10", "root", "", "https://model.example", "synthetic-replacement", "test-model");
-    click_label(&mut workbench, &context, "保存配置");
-    assert!(rendered(&mut workbench, &context).contains("配置已保存"));
-    assert_eq!(workbench.pending_count(), 0);
-    assert!(!std::fs::read_to_string(&path).unwrap().contains("synthetic-replacement"));
-    drop(workbench);
-    let mut restarted = desktop::Workbench::new(ServiceOptions {
-        mode: Mode::Real, state_dir: root.path().join("ui"), worker_exe: "unused.exe".into(), gateway_key: None, gateway_model_token: None,
-    }, &context).unwrap();
-    open_settings(&mut restarted, &context);
-    assert!(!restarted.onboarding_secrets_empty_for_test(), "new synthetic key must recover");
-    assert!(!rendered(&mut restarted, &context).contains("API key 未恢复"));
-    click_label(&mut restarted, &context, "自动准备并连接 Worker");
-    assert!(rendered(&mut restarted, &context).contains("请填写 root 密码"));
-    assert_eq!(restarted.pending_count(), 0);
+    assert_eq!(workbench.pending_count(), 0, "corrupt config must not start provisioning");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "read/invalid prepare must not rewrite a corrupt file");
 }
 
 #[test]
-fn partial_recovery_reopen_preserves_edits_and_recovers_same_origin_key() {
-    let (root, path, original) = partial_recovery_fixture();
+fn explicit_resave_replaces_a_corrupt_plaintext_config() {
+    let (root, path) = corrupt_plaintext_fixture();
     let context = egui::Context::default();
     let mut workbench = desktop::Workbench::new(ServiceOptions {
         mode: Mode::Real, state_dir: root.path().join("ui"), worker_exe: "unused.exe".into(), gateway_key: None, gateway_model_token: None,
     }, &context).unwrap();
-    // Unsaved ordinary fields must survive reopening, even if a key reappears.
-    workbench.set_onboarding_fields_for_test("192.0.2.44", "deploy", "", "https://model.example", "", "edited-model");
     open_settings(&mut workbench, &context);
-    assert!(workbench.onboarding_secrets_empty_for_test());
-    click_label(&mut workbench, &context, "关闭设置");
-    std::fs::write(&path, original).unwrap();
-    open_settings(&mut workbench, &context);
-    let text = rendered(&mut workbench, &context);
-    for value in ["192.0.2.44", "deploy", "https://model.example", "edited-model"] {
-        assert!(text.lines().any(|line| line == value), "reopen replaced edited field: {value}; {text}");
-    }
-    assert!(!workbench.onboarding_secrets_empty_for_test(), "same-origin synthetic key must recover");
-    assert!(text.contains("API key 已恢复") && text.contains("不代表 Worker 已连接"));
-    assert!(!text.contains("API key 不可用") && !text.contains("API key 未恢复"), "stale key failure remained: {text}");
+    workbench.set_onboarding_fields_for_test("192.0.2.10", "root", "synthetic-password", "https://model.example", "synthetic-replacement", "test-model");
+    click_label(&mut workbench, &context, "保存配置");
+    assert!(rendered(&mut workbench, &context).contains("配置已保存"));
     assert_eq!(workbench.pending_count(), 0);
-    assert!(workbench.snapshot().gateway.is_none());
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("synthetic-replacement"));
+    drop(workbench);
+    let context = egui::Context::default();
+    let mut restarted = desktop::Workbench::new(ServiceOptions {
+        mode: Mode::Real, state_dir: root.path().join("ui"), worker_exe: "unused.exe".into(), gateway_key: None, gateway_model_token: None,
+    }, &context).unwrap();
+    open_settings(&mut restarted, &context);
+    assert!(!restarted.onboarding_secrets_empty_for_test(), "re-saved plaintext key must restore");
+    assert!(!rendered(&mut restarted, &context).contains("本机连接配置损坏"));
+    assert_eq!(restarted.pending_count(), 0);
 }
 
 #[test]
@@ -313,18 +369,17 @@ fn partial_recovery_save_failure_blocks_preparation_without_a_request() {
     let mut workbench = desktop::Workbench::new(ServiceOptions {
         mode: Mode::Real, state_dir: root.path().join("ui"), worker_exe: "unused.exe".into(), gateway_key: None, gateway_model_token: None,
     }, &context).unwrap();
-    // Real filesystem replacement failure, not a mocked save result. Only the
-    // in-process Vault receives synthetic input; no provisioner is invoked.
-    std::fs::create_dir_all(root.path().join("ui/worker-settings.json")).unwrap();
+    // Real filesystem replacement failure, not a mocked save result.
+    std::fs::create_dir_all(root.path().join("ui/connection-settings.json")).unwrap();
     valid_onboarding_fields(&mut workbench);
     open_settings(&mut workbench, &context);
     click_label(&mut workbench, &context, "自动准备并连接 Worker");
     let text = rendered(&mut workbench, &context);
-    assert!(text.contains("无法读写连接设置"), "save failure was hidden: {text}");
+    assert!(text.contains("无法读写本机连接配置"), "save failure was hidden: {text}");
     assert!(!text.contains("配置已保存"));
     assert_eq!(workbench.pending_count(), 0);
     assert!(workbench.snapshot().gateway.is_none());
-    assert!(root.path().join("ui/worker-settings.json").is_dir());
+    assert!(root.path().join("ui/connection-settings.json").is_dir());
 }
 
 // Catches losing the actionable local failure category while projecting a
@@ -456,7 +511,7 @@ fn missing_root_password_submit_shows_actionable_copy_without_starting_provision
     open_settings(&mut workbench, &context);
     click_label(&mut workbench, &context, "自动准备并连接 Worker");
     let text = rendered(&mut workbench, &context);
-    assert!(text.contains("请填写 root 密码；仅用于本次准备，不会写入回执或日志"), "missing root password copy not rendered: {text}");
+    assert!(text.contains("请填写 Worker 密码；保存在本机明文配置文件，不写入回执或日志"), "missing root password copy not rendered: {text}");
     assert!(!text.contains("synthetic-token"), "API key leaked into rendered text: {text}");
     assert_eq!(workbench.pending_count(), 0, "invalid input must not start provisioning");
 }
@@ -477,7 +532,7 @@ fn missing_api_key_submit_shows_actionable_copy_without_starting_provision() {
     open_settings(&mut workbench, &context);
     click_label(&mut workbench, &context, "自动准备并连接 Worker");
     let text = rendered(&mut workbench, &context);
-    assert!(text.contains("请填写 API key；仅用于本次准备，不会写入回执或日志"), "missing API key copy not rendered: {text}");
+    assert!(text.contains("请填写 API key；保存在本机明文配置文件，不写入日志或回执"), "missing API key copy not rendered: {text}");
     assert!(!text.contains("synthetic-password"), "root password leaked into rendered text: {text}");
     assert_eq!(workbench.pending_count(), 0, "invalid input must not start provisioning");
 }
@@ -544,7 +599,7 @@ fn reprepare_validation_error_overrides_gateway_status_copy() {
     open_settings(&mut workbench, &context);
     click_label(&mut workbench, &context, "自动准备并连接 Worker");
     let text = rendered(&mut workbench, &context);
-    assert!(text.contains("请填写 root 密码；仅用于本次准备，不会写入回执或日志"), "reprepare must show validator copy: {text}");
+    assert!(text.contains("请填写 Worker 密码；保存在本机明文配置文件，不写入回执或日志"), "reprepare must show validator copy: {text}");
     assert!(!text.contains("会话凭据已超时，需要重新准备 Worker"), "stale gateway status must not hide input correction: {text}");
     assert_eq!(workbench.pending_count(), 0, "invalid reprepare input must not start provisioning");
 }
@@ -579,13 +634,14 @@ fn expired_session_credentials_are_not_submit_ready() {
         used_slots: 0,
         artifact_sha256: "a".repeat(64),
     })));
+    dismiss_first_launch_settings(&mut workbench, &context);
     let text = rendered(&mut workbench, &context);
     assert_eq!(desktop::provisioning_status_copy(&workbench.snapshot(), &desktop::pending::Pending::default(), None, None), "会话凭据已超时，需要重新准备 Worker");
     assert!(text.contains("会话凭据已超时，需要重新准备 Worker"), "expired credentials must be visible: {text}");
     assert!(text.contains("连接设置"), "expired credentials must offer explicit reauthentication: {text}");
-    assert!(!text.contains("Linux 工作节点 IP"), "expired session must not automatically cover the workflow");
+    assert!(!text.contains("Worker 配置机"), "expired session must not automatically cover the workflow");
     open_settings(&mut workbench, &context);
-    assert!(rendered(&mut workbench, &context).contains("Linux 工作节点 IP"));
+    assert!(rendered(&mut workbench, &context).contains("Worker 配置机"));
     assert!(!text.contains("Worker 已连接，可提交项目"), "expired credentials must not look submit-ready: {text}");
 }
 
@@ -651,9 +707,10 @@ fn rendered_onboarding_cards_cover_pending_failure_waiting_and_connected() {
 
     let mut workbench = app(&context);
     workbench.set_snapshot_for_test(snapshot(Some(GatewayView { worker_id: "worker-a".into(), host: "192.0.2.1".into(), remote_verified: false, preflight_passed: true, credentials_available: true, used_slots: 0, artifact_sha256: "a".repeat(64) })));
+    dismiss_first_launch_settings(&mut workbench, &context);
     let connected_text = rendered(&mut workbench, &context);
     assert!(connected_text.contains("Worker 已连接，可提交项目"), "connected card missing: {connected_text}");
-    assert!(!connected_text.contains("Linux 工作节点 IP"), "connected card must hide onboarding form: {connected_text}");
+    assert!(!connected_text.contains("Worker 配置机"), "connected card must hide onboarding form: {connected_text}");
 }
 
 #[test]
@@ -661,16 +718,17 @@ fn explicit_reprepare_reopens_form_without_submitting_a_second_request() {
     let context = egui::Context::default();
     let mut workbench = app(&context);
     workbench.set_snapshot_for_test(snapshot(Some(GatewayView { worker_id: "worker-a".into(), host: "192.0.2.1".into(), remote_verified: false, preflight_passed: true, credentials_available: true, used_slots: 0, artifact_sha256: "a".repeat(64) })));
+    dismiss_first_launch_settings(&mut workbench, &context);
     let connected_text = rendered(&mut workbench, &context);
     assert!(connected_text.contains("重新准备 Worker"), "reprepare action missing: {connected_text}");
-    assert!(!connected_text.contains("Linux 工作节点 IP"), "connected form must stay hidden: {connected_text}");
+    assert!(!connected_text.contains("Worker 配置机"), "connected form must stay hidden: {connected_text}");
     assert_eq!(workbench.pending_count(), 0);
 
     click_label(&mut workbench, &context, "重新准备 Worker");
     let reopened_text = rendered(&mut workbench, &context);
     assert!(workbench.onboarding_form_open_for_test());
     assert!(workbench.onboarding_reprepare_visible_for_test(&snapshot(Some(GatewayView { worker_id: "worker-a".into(), host: "192.0.2.1".into(), remote_verified: false, preflight_passed: true, credentials_available: true, used_slots: 0, artifact_sha256: "a".repeat(64) }))));
-    assert!(reopened_text.contains("Linux 工作节点 IP"), "reprepare must expose the form: {reopened_text}");
+    assert!(reopened_text.contains("Worker 配置机"), "reprepare must expose the form: {reopened_text}");
     assert!(reopened_text.contains("重新准备 Worker"), "reprepare control must remain available: {reopened_text}");
     assert_eq!(workbench.pending_count(), 0, "reprepare must not submit provisioning automatically");
 }
@@ -811,16 +869,18 @@ fn novice_onboarding_starts_with_unstarted_status_card() {
 }
 
 #[test]
-fn initial_onboarding_form_shows_six_safe_field_hints() {
+fn initial_onboarding_form_shows_safe_section_and_field_hints() {
     let context = egui::Context::default();
     let mut workbench = app(&context);
     open_settings(&mut workbench, &context);
     let text = rendered(&mut workbench, &context);
 
     for hint in [
+        "模型配置",
+        "Worker 配置机",
         "例如 192.168.1.20",
         "通常为 root",
-        "仅用于本次准备，不会写入回执或日志",
+        "明文保存在本机配置文件",
         "例如 https://boapi.uno:18317；必须是 HTTPS origin",
         "例如 gpt-6.1-sol",
     ] {

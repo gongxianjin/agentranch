@@ -118,6 +118,14 @@ fn expand_project_directories(app: &mut desktop::Workbench, ctx: &egui::Context)
     // both user-facing pointer clicks instead of setting an internal seam.
     // Ordinary workflow must not paint the retained engineering controls.
     ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.0);
+    // First real-mode launch opens the settings modal by design; dismiss it so
+    // the workflow navigation underneath is reachable. The modal needs a
+    // settling pass before its footer renders in headless output.
+    if app.onboarding_form_open_for_test() {
+        render(app, ctx);
+        click_label(app, ctx, "关闭设置");
+        render(app, ctx);
+    }
     let ordinary = render(app, ctx);
     let ordinary_text = rendered_text(&ordinary);
     assert!(!ordinary_text.contains("项目与产物目录"), "ordinary workflow exposed project paths: {ordinary_text}");

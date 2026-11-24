@@ -227,8 +227,8 @@ fn ordinary_onboarding_field_paste_replaces_selection_and_preserves_other_fields
     let mut workbench = app(&context);
     onboarding_fields(&mut workbench);
 
-    click_field(&mut workbench, &context, "Linux 工作节点 IP");
-    select_all_field(&mut workbench, &context, "Linux 工作节点 IP");
+    click_field(&mut workbench, &context, "IP");
+    select_all_field(&mut workbench, &context, "IP");
     let output = paste(&mut workbench, &context, "节点-Δ-東京");
     let text = rendered_text(&output);
 
@@ -246,14 +246,14 @@ fn password_paste_replaces_selection_without_rendering_the_secret() {
     let mut workbench = app(&context);
     onboarding_fields(&mut workbench);
 
-    click_field(&mut workbench, &context, "root 密码");
-    select_all_field(&mut workbench, &context, "root 密码");
+    click_field(&mut workbench, &context, "密码");
+    select_all_field(&mut workbench, &context, "密码");
     let output = paste(&mut workbench, &context, "新密码-秘密");
     let text = rendered_text(&output);
 
     assert!(!text.contains("新密码-秘密"), "password paste leaked into rendered text: {text}");
     assert!(!text.contains("synthetic-root-password"));
-    assert!(text.contains("root 密码"), "password control disappeared: {text}");
+    assert!(text.contains("密码"), "password control disappeared: {text}");
 }
 
 #[test]
@@ -262,8 +262,8 @@ fn selected_ordinary_text_is_copied_but_selection_alone_does_not_copy() {
     let mut workbench = app(&context);
     onboarding_fields(&mut workbench);
 
-    click_field(&mut workbench, &context, "Linux 工作节点 IP");
-    let selected = select_all_field(&mut workbench, &context, "Linux 工作节点 IP");
+    click_field(&mut workbench, &context, "IP");
+    let selected = select_all_field(&mut workbench, &context, "IP");
     assert!(
         copy_commands(&selected).is_empty(),
         "selection must not auto-copy: {:?}",
@@ -280,8 +280,8 @@ fn selected_password_text_is_copied_without_unmasking_the_control() {
     let mut workbench = app(&context);
     onboarding_fields(&mut workbench);
 
-    click_field(&mut workbench, &context, "root 密码");
-    select_all_field(&mut workbench, &context, "root 密码");
+    click_field(&mut workbench, &context, "密码");
+    select_all_field(&mut workbench, &context, "密码");
     let copied = copy_selected(&mut workbench, &context);
 
     assert_eq!(copy_commands(&copied), vec!["synthetic-root-password".to_owned()]);
@@ -311,8 +311,8 @@ fn focus_and_selection_never_emit_plaintext_copy_or_accessibility_text() {
     assert!(!accesskit.contains("synthetic-root-password"));
     assert!(!accesskit.contains("synthetic-api-key"));
 
-    click_field(&mut workbench, &context, "root 密码");
-    let selected = select_all_field(&mut workbench, &context, "root 密码");
+    click_field(&mut workbench, &context, "密码");
+    let selected = select_all_field(&mut workbench, &context, "密码");
     assert!(
         copy_commands(&selected).is_empty(),
         "focus/selection emitted CopyText: {:?}",
