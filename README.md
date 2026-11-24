@@ -2,6 +2,13 @@
 
 **把"定稿设计文档"变成"已验收交付物"的本地工作台**：原生 Rust + egui 的 Windows 管理器 + Linux agent-worker。设计文档导入 → 任务拆分 → 逐项审核 → 开发 → 测试 → 验收，每一步都有显式门槛和可追溯证据，绝不把"看起来完成了"当作"完成了"。
 
+> **定位**：面向高级开发者的自用型编码 Agent 调度工作台，**不是企业级基础设施**，也不是可供他人依赖的生产系统。
+
+- **支持**：SSH 远程 Worker、四角色流水线、调度 Claude Code / Codex CLI、git worktree 隔离。
+- **不承诺**：高可用、权限加密、多租户、公网安全加固、SLA 与故障兜底。
+- **安全提示**：模型 API key 与每台 Worker 的账号密码以**明文**保存在本机配置文件，仅限单机个人内网场景使用；这台机器交给别人之前，先删除 `connection-settings.json`。
+- **维护状态**：单人维护，issue / PR 响应视作者空闲时间，请勿按成熟商业项目的标准要求。
+
 ```
 ┌────────────────────── Windows ──────────────────────┐   ┌──── Linux B ────┐
 │  agentranch.exe (GUI Manager)                        │   │  aw-cli (worker) │
@@ -11,20 +18,36 @@
 └──────────────────────────────────────────────────────┘
 ```
 
-## 在你用之前，先知道它是什么水平
+## 项目状态（WIP / Under Construction）
 
-这个项目很年轻（2026-10 建库、单作者、无 star）。它不假装成熟：下面这张表是每一项能力的真实验证状态，README 里的每个"已完成"都有本地测试背书，每个没跑通的都明说。
+这个项目很年轻（2026-10 建库、单作者、无 star），正处在**作者自用原型**阶段。下面按"已可用 / 待实现 / 已知限制"三类如实标注；README 里每个"已完成"都有本地测试背书，没跑通的都明说。
 
-| 能力 | 状态 |
+### 已可用
+
+| 能力 | 验证范围 |
 |---|---|
-| 14 阶段工作流 + SQLite 账本 + 人工门控 | ✅ 已验证（本地 headless 测试 + 真实 GUI pointer 测试） |
-| 双击默认进入 real 模式、首次打开连接设置 | ✅ 已验证（GUI 测试） |
-| 模型配置 + 四角色 Worker 明文保存/重启恢复 | ✅ 已验证（`rust_connection_settings` 8/8） |
-| CLI（`check`/`mcp`/`local-check`/`runner`/`controller`） | ✅ 已验证（本地） |
-| 多 Worker 四角色协作派工（拆分→开发→测试→审查） | 🚧 建设中：角色配置已落地，流水线派工未实现 |
-| 外部模型连接与真实执行 | 🚧 建设中（NOT_RUN，见[当前明确未覆盖](#当前明确未覆盖)） |
-| 远程退出/取消证据 | 🚧 建设中（NOT_RUN） |
-| 签名 / installer / Windows 原生窗口验收 | ❌ 未做（NOT_RUN） |
+| 14 阶段工作流 + SQLite 账本 + 人工门控 | 本地 headless 测试 + 真实 GUI pointer 测试 |
+| 双击默认进入 real 模式、首次打开连接设置 | GUI 测试 |
+| 模型配置 + 四角色 Worker 明文保存 / 重启恢复 | `rust_connection_settings` 8/8 |
+| CLI（`check` / `mcp` / `local-check` / `runner` / `controller`） | 本地 |
+
+### 待实现（WIP）
+
+| 能力 | 现状 |
+|---|---|
+| 多 Worker 四角色流水线派工（拆分→开发→测试→审查） | 角色配置已落地，自动流转未实现 |
+| 外部模型连接与真实执行 | `NOT_RUN` |
+| 远程退出 / 取消证据 | `NOT_RUN` |
+
+### 已知限制
+
+| 限制 | 说明 |
+|---|---|
+| 凭据明文存储 | API key 与 Worker 密码明文落在本机 `connection-settings.json`，不加密 |
+| 单机 / 单用户 / 无并发设计 | 不支持多租户、权限隔离 |
+| 无签名 / 无 installer | 双击会有 SmartScreen 提示，属预期 |
+| Windows 原生窗口验收 | 未做（`NOT_RUN`） |
+| 构建平台 | 仅声明 Windows（x64 MinGW）+ Linux worker 路径，未声明其他平台已验证 |
 
 ## 30 秒开始
 
@@ -153,13 +176,19 @@ py -3 -I .test-scripts\local\run_regression.py
 
 冻结版要求同一 source inventory、offline Cargo metadata、build identity 与同目录两个 Windows PE；build identity 机械校验 source digest、target、toolchain、profile、版本及两个 exe 的字节 SHA-256。打包前检查：两 exe 存在且为 PE、source 无漂移、build identity 一致、PE imports 可解析、输出已存在则失败保留旧证据、`PACKAGE-MANIFEST.json` 与 ZIP entry/字节回环核对。失败退出码 `2` 并保留 `PACKAGE-FAILURE.json`；成功状态 `PACKAGE_CREATED_RUNTIME_NOT_YET_VERIFIED` 仅表示包内输入与哈希核验完成，发布前仍需同版原生运行验收。
 
-## 当前明确未覆盖
+## 验收边界口径
 
-以下边界标为 `NOT_RUN`：外部模型连接与真实执行、真实项目开发、多 Worker 协作派工、远程退出/取消、Windows native window acceptance、签名/installer、Stop10 及其他未实际运行的 gate。已运行验证限于本地 headless Rust/SQLite、真实 GUI pointer action、本地 service/ledger、synthetic ingress、独立 `ExitProof` 与 managed-artifact 状态投影、连接设置明文持久化；这些结果不证明外部执行或真实产品包已验收。
+上面「待实现」与「已知限制」中的条目，在内部验收记录里统一标为 `NOT_RUN`，含义是**未实际运行验证**，不是"已失败"或"已损坏"：外部模型连接与真实执行、真实项目开发、多 Worker 协作派工、远程退出/取消、Windows native window acceptance、签名/installer、Stop10 及其他未实际运行的 gate。
+
+已运行验证的范围仅限：本地 headless Rust/SQLite、真实 GUI pointer action、本地 service/ledger、synthetic ingress、独立 `ExitProof` 与 managed-artifact 状态投影、连接设置明文持久化。这些结果不证明外部执行，也不证明真实产品包已验收——引用本仓库时请以实际探测与退出证据为准。
 
 ## License
 
-[MIT](LICENSE)
+主仓库（Rust 核心 + egui 管理器 + CLI）：[MIT](LICENSE) © 2026 advengong。
+
+`agentranch-dsh-plugin/` 子目录为独立 MIT 协议，见 [agentranch-dsh-plugin/LICENSE](agentranch-dsh-plugin/LICENSE)，其 `package.json` 亦声明 `"license": "MIT"`。
+
+MIT 协议按"现状（AS IS）"提供，不附带任何担保。上文"定位 / 不承诺 / 安全提示"是使用前必须知道的边界，协议本身不会替你承担明文凭据、数据丢失或误操作的风险。
 
 ---
 
