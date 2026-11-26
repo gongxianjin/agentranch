@@ -13,7 +13,7 @@ use worker_submit::WorkerSubmitGate;
 #[path = "../../tests/support/settings_vault.rs"]
 mod settings_vault;
 use std::{collections::VecDeque, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
-use agentranch::{config::Mode, core::{provision_ledger::LedgerState, service::{validate_provision_input, AppSnapshot, ProvisionRequest, ServiceError, ServiceHandle, ServiceOptions, UiCommand, SubmitError, Readiness, RunView}}};
+use agentranch::{api::backend::Backend, config::Mode, core::{provision_ledger::LedgerState, service::{validate_provision_input, AppSnapshot, ProvisionRequest, ServiceError, ServiceHandle, ServiceOptions, UiCommand, SubmitError, Readiness, RunView}}};
 use serde_json::Value;
 use eframe::egui::{self, RichText};
 
@@ -141,7 +141,7 @@ pub fn provisioning_status_copy(snapshot: &AppSnapshot, pending: &pending::Pendi
 }
 
 pub struct Workbench {
-    service: ServiceHandle,
+    service: Box<dyn Backend>,
     pending: pending::Pending,
     receipts: VecDeque<Receipt>,
     selected: Option<String>,
@@ -199,7 +199,11 @@ impl Workbench {
     }
 
     /// Attach the ordinary UI to an existing core service; no native window is required.
-    pub fn from_service(mut service: ServiceHandle, ctx: &egui::Context, state_dir: String) -> Self {
+    pub fn from_service(service: ServiceHandle, ctx: &egui::Context, state_dir: String) -> Self {
+        Self::from_backend(Box::new(service), ctx, state_dir)
+    }
+
+    fn from_backend(mut service: Box<dyn Backend>, ctx: &egui::Context, state_dir: String) -> Self {
         let template = if service.snapshot().mode == Mode::Local { "sum-native-v1" } else { "sum-v1" }.into();
         let mut visuals = egui::Visuals::light();
         visuals.override_text_color = Some(egui::Color32::from_rgb(34, 50, 71));

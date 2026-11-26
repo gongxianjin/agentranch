@@ -1,9 +1,6 @@
-use std::{path::{Path, PathBuf}, process::Command};
+use std::path::{Path, PathBuf};
 use anyhow::ensure;
-use agentranch::config::Mode;
-use serde_json::Value;
-
-const WORKER_BINARY: &str = if cfg!(windows) { "aw-cli.exe" } else { "aw-cli" };
+use agentranch::{config::Mode, worker_identity::{validate_worker, worker_executable}};
 
 #[derive(Debug)]
 pub struct Launch {
@@ -40,27 +37,10 @@ impl Launch {
         let mode = mode.unwrap_or(Mode::Real);
         ensure!(mode == Mode::Real || !gateway_key_stdin,"--gateway-key-stdin requires --real");
         let state_dir = state.unwrap_or_else(|| data_home.join("agentranch").join(match mode { Mode::Real => "real", Mode::Local => "local" }));
-        let parent = executable.parent().ok_or_else(|| anyhow::anyhow!("application executable has no parent directory"))?;
-        let worker_exe = parent.join(WORKER_BINARY);
+        let worker_exe = worker_executable(executable)?;
         if mode == Mode::Local {
             validate_worker(&worker_exe)?;
         }
         Ok(Self { mode, state_dir, worker_exe, gateway_key_stdin })
     }
-}
-
-fn validate_worker(worker_exe: &Path) -> anyhow::Result<()> {
-    anyhow::ensure!(worker_exe.is_file(), "sibling worker executable is missing");
-    let output = Command::new(worker_exe).arg("--identity").output()
-        .map_err(|_| anyhow::anyhow!("sibling worker identity could not be read"))?;
-    anyhow::ensure!(output.status.success(), "sibling worker identity could not be read");
-    let actual: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| anyhow::anyhow!("sibling worker identity mismatch"))?;
-    let expected = serde_json::json!({
-        "binary": WORKER_BINARY.trim_end_matches(".exe"),
-        "package": env!("CARGO_PKG_NAME"),
-        "version": env!("CARGO_PKG_VERSION"),
-    });
-    anyhow::ensure!(actual == expected, "sibling worker identity mismatch");
-    Ok(())
 }

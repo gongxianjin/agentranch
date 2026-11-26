@@ -1,7 +1,4 @@
-#![cfg(feature = "gui")]
-#[path = "../src/desktop/connection_settings.rs"]
-mod connection_settings;
-use connection_settings::{ConfiguredWorker, ConnectionSettings, ConnectionSettingsError, ConnectionSettingsStore, ModelSettings, WorkerRole};
+use agentranch::connection_settings::{ConfiguredWorker, ConnectionSettings, ConnectionSettingsError, ConnectionSettingsStore, ModelSettings, WorkerRole};
 
 fn worker(id: &str, host: &str, role: WorkerRole, password: &str) -> ConfiguredWorker {
     ConfiguredWorker { id: id.into(), role, host: host.into(), username: "root".into(), password: password.into() }

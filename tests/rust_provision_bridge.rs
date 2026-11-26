@@ -57,18 +57,32 @@ fn retry_context_always_allocates_fresh_output_and_preserves_old_attempt() {
 }
 
 #[test]
-fn retry_context_rejects_symlink_parent_before_helper_mutation() {
+fn retry_context_rejects_linked_state_before_helper_mutation() {
     let root = tempfile::tempdir().unwrap();
     let real = root.path().join("real");
     std::fs::create_dir_all(&real).unwrap();
     let link = root.path().join("state-link");
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&real, &link).unwrap();
+    {
+        // A junction exercises the Windows reparse check without symlink privileges.
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction creation failed: {status}");
+    }
     #[cfg(unix)]
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
     let error = ProvisioningContext::retry_from(&link).unwrap_err();
-    assert!(error.to_string().contains("symlink") || error.to_string().contains("reparse"));
+    assert!(
+        error.to_string().contains("provisioning path contains a symlink")
+            || error.to_string().contains("provisioning path contains a reparse point"),
+        "unexpected linked-state rejection: {error}"
+    );
+    assert!(!real.join("provisioning").exists());
 }
 
 #[test]

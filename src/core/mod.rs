@@ -16,6 +16,7 @@ pub mod owner_project;
 pub mod owner_project_child;
 pub mod live_output;
 pub mod model_stream;
+pub mod model_request;
 pub mod native_worker;
 pub mod ssh_gateway;
 pub mod ssh_manager;

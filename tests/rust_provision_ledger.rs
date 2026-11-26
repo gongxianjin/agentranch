@@ -165,27 +165,39 @@ fn controller_reparse_record_is_blocked_before_controller_config_read() {
     std::fs::create_dir_all(&output).unwrap();
     let controller_target = root.path().join("controller-target.json");
     let controller_path = output.join("controller.json");
-    std::fs::write(&controller_target, serde_json::to_vec(&json!({
-        "schema": "ao-reason-config/1",
-        "mode": "real",
-        "role": "controller",
-        "deployment": "ledger-fixture",
-        "state_dir": output.join("controller-state"),
-        "nodes": [{
-            "id": "worker-a",
-            "address": "192.0.2.10:22",
-            "key_file": output.join("protocol.key"),
-            "slots": 1,
-            "templates": ["sum-v1", "control-v1", "project-work-v1"],
-            "admitted": true,
-            "healthy": false,
-            "draining": false
-        }]
-    })).unwrap()).unwrap();
     #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&controller_target, &controller_path).unwrap();
+    {
+        // A junction exercises the Windows reparse check without symlink privileges.
+        std::fs::create_dir(&controller_target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&controller_path)
+            .arg(&controller_target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction creation failed: {status}");
+    }
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&controller_target, &controller_path).unwrap();
+    {
+        std::fs::write(&controller_target, serde_json::to_vec(&json!({
+            "schema": "ao-reason-config/1",
+            "mode": "real",
+            "role": "controller",
+            "deployment": "ledger-fixture",
+            "state_dir": output.join("controller-state"),
+            "nodes": [{
+                "id": "worker-a",
+                "address": "192.0.2.10:22",
+                "key_file": output.join("protocol.key"),
+                "slots": 1,
+                "templates": ["sum-v1", "control-v1", "project-work-v1"],
+                "admitted": true,
+                "healthy": false,
+                "draining": false
+            }]
+        })).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&controller_target, &controller_path).unwrap();
+    }
     let gateway_path = output.join("gateway.json");
     std::fs::write(&gateway_path, serde_json::to_vec(&json!({
         "schema": "native-ssh-gateway/1",
@@ -225,6 +237,11 @@ fn controller_reparse_record_is_blocked_before_controller_config_read() {
     std::fs::write(root.path().join("provisioning-ledger.json"), serde_json::to_vec(&ledger).unwrap()).unwrap();
     let error = ProvisionLedger::load(root.path()).unwrap_err();
     assert!(error.is_blocked(), "controller reparse path must be blocked: {error:?}");
+    assert!(
+        error.to_string().contains("provisioning path contains a symlink")
+            || error.to_string().contains("provisioning path contains a reparse point"),
+        "controller rejection must come from the linked-path guard before reading: {error:?}"
+    );
 }
 
 #[cfg(windows)]

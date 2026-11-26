@@ -506,8 +506,20 @@ impl Store {
         tx.execute("INSERT INTO runs(id,body,status,attempt) VALUES(?1,?2,?3,?4)",params![r.id,serde_json::to_string(&r)?,r.status,r.attempt])?;tx.commit()?;Ok(r)
     }
     pub fn dispatch_project(&mut self,actor:&Actor,work:&super::project_work::ProjectWork,now:u64)->Result<Run>{
+        self.dispatch_project_pinned(actor,work,now,None)
+    }
+    /// Queue project work, optionally recording the node it must run on. The pin
+    /// only restricts *which* node may take the run; the normal readiness probe
+    /// still gates assignment, so a role-bound node that is not ready stays
+    /// queued instead of being forced into an unverified dispatch.
+    pub fn dispatch_project_pinned(&mut self,actor:&Actor,work:&super::project_work::ProjectWork,now:u64,pinned_node:Option<&str>)->Result<Run>{
         work.validate()?;let actor_id=match actor{Actor::Local(s)|Actor::AoSession(s)=>s};ensure!(crate::config::valid_id(actor_id),"invalid trusted actor");
-        let run=Run{id:Uuid::new_v4().to_string(),owner:actor.clone(),template:"project-work-v1".into(),status:"queued".into(),attempt:1,epoch:Uuid::new_v4().to_string(),session:None,spawn_intent:false,deadline:now.checked_add(900).context("deadline overflow")?,detail:json!({"created_at":now,"progress_at":now,"project_work":work})};
+        let mut detail=json!({"created_at":now,"progress_at":now,"project_work":work});
+        if let Some(node)=pinned_node {
+            ensure!(self.nodes.iter().any(|n|n.id==node),"pinned node is not configured");
+            detail["pinned_node"]=json!(node);
+        }
+        let run=Run{id:Uuid::new_v4().to_string(),owner:actor.clone(),template:"project-work-v1".into(),status:"queued".into(),attempt:1,epoch:Uuid::new_v4().to_string(),session:None,spawn_intent:false,deadline:now.checked_add(900).context("deadline overflow")?,detail};
         // Check the actual signed JSON frame for every trusted possible route before queue insertion.
         let capable:Vec<_>=self.nodes.iter().filter(|n|n.templates.iter().any(|t|t=="project-work-v1")).collect();ensure!(!capable.is_empty(),"no project-work capable node configured");
         for node in capable{let mut m=Envelope{schema:PROTOCOL.into(),message_id:Uuid::new_v4().to_string(),deployment:self.deployment.clone(),from:"A".into(),to:node.id.clone(),run_id:run.id.clone(),attempt:run.attempt,epoch:run.epoch.clone(),kind:"start".into(),sent_at:now,expires_at:now.saturating_add(300),payload:json!({"template":run.template,"deadline":run.deadline,"project_work":work}),mac:String::new()};m.sign(&hex::decode(&node.key_hex)?)?;m.verify(&hex::decode(&node.key_hex)?,&self.deployment,&node.id,now).context("document execution exceeds native signed frame limit; import is retained but no task is queued")?;}
@@ -543,12 +555,15 @@ impl Store {
         let Some(id)=id else{return Ok(None)};
         let mut run=read_run(&tx,&id)?;
         let prior:Option<String>=tx.query_row("SELECT node FROM assignments WHERE run=?1 ORDER BY attempt DESC LIMIT 1",[&id],|r|r.get(0)).optional()?;
+        // A role-bound run may only be taken by its pinned node. The readiness
+        // probe still applies, so an unready pin keeps the run queued.
+        let pinned_run_node:Option<String>=run.detail.get("pinned_node").and_then(|value|value.as_str()).map(str::to_owned);
         let mut choices=Vec::new();
         for n in &self.nodes {
             let ready:Option<String>=tx.query_row("SELECT value FROM metadata WHERE key=?1",[format!("probe:{}",n.id)],|row|row.get(0)).optional()?;
             let verified=match ready.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()) {Some(value)=>value["ready"]==true&&value["expires_at"].as_u64().is_some_and(|expires|now<expires),None=>n.healthy};
             let direct_pinned=artifact.is_some()&&n.id==worker_id&&matches!(run.template.as_str(),"sum-v1"|"project-work-v1");
-            if !n.admitted||(!direct_pinned&&(!n.healthy||(self.readiness_required&&!verified)))||n.draining||!n.templates.contains(&run.template)||prior.as_ref().is_some_and(|p|p!=&n.id)||(!worker_id.is_empty()&&n.id!=worker_id){continue;}
+            if !n.admitted||(!direct_pinned&&(!n.healthy||(self.readiness_required&&!verified)))||n.draining||!n.templates.contains(&run.template)||prior.as_ref().is_some_and(|p|p!=&n.id)||(!worker_id.is_empty()&&n.id!=worker_id)||pinned_run_node.as_ref().is_some_and(|pin|pin!=&n.id){continue;}
             let used:i64=tx.query_row("SELECT count(*) FROM assignments WHERE node=?1 AND released=0",[&n.id],|r|r.get(0))?;
             if used<i64::from(n.slots){choices.push((n,used));}
         }

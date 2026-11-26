@@ -66,13 +66,19 @@ fn call_model(endpoint: &crate::adapters::model_endpoint::ModelEndpoint, token: 
     });
     let request_bytes = serde_json::to_vec(&body)?;
     let started = Instant::now();
-    let response = client
-        .post(format!("{}/v1/chat/completions", endpoint.base_url.trim_end_matches('/')))
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .context("model HTTP request failed")?;
-    let status = response.status().as_u16();
+    // One total budget covering connect, headers and the whole stream. The
+    // pinned client's own timeout only bounds individual blocking reads, so a
+    // drip-feeding endpoint could otherwise hold the owner child open past
+    // the gateway exchange window and turn a slow call into an unknown run.
+    let timeout = std::time::Duration::from_secs(endpoint.timeout_secs);
+    let response = super::model_request::send_chat_request(
+        &client,
+        &format!("{}/v1/chat/completions", endpoint.base_url.trim_end_matches('/')),
+        token,
+        &body,
+        timeout,
+    )?;
+    let status = response.status();
     ensure!(status == 200, "model HTTP status {status}");
     let mut live = |event: LiveOutput| {
         let mut stderr = std::io::stderr().lock();
