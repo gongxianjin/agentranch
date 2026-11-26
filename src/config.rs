@@ -50,9 +50,25 @@ pub struct AoConfig {pub base_url:String,pub project_id:String,pub model:String}
 pub struct NodeConfig {
     pub id: String, pub address: String, pub key_file: std::path::PathBuf,
     pub slots: u32, pub templates: Vec<String>,
+    /// Fixed pipeline role this node performs. Absent configs keep the previous
+    /// "any capable node" behaviour, so existing config files still load.
+    #[serde(default)] pub role: Option<NodeRole>,
     #[serde(default)] pub admitted: bool,
     #[serde(default)] pub healthy: bool,
     #[serde(default)] pub draining: bool,
+}
+
+/// The four fixed collaboration roles. One node per role: work moves
+/// split → develop → test → review, with an artifact review after development
+/// and an evidence review after testing.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole { Split, Develop, Test, Review }
+impl NodeRole {
+    pub const ALL: [Self; 4] = [Self::Split, Self::Develop, Self::Test, Self::Review];
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Split => "split", Self::Develop => "develop", Self::Test => "test", Self::Review => "review" }
+    }
 }
 impl std::fmt::Debug for NodeSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,10 +84,13 @@ impl Config {
         anyhow::ensure!(valid_id(&self.deployment), "invalid deployment");
         anyhow::ensure!(matches!(self.role.as_str(), "controller" | "runner"), "invalid role");
         anyhow::ensure!(!self.state_dir.as_os_str().is_empty(), "missing state directory");
-        let (mut ids, mut addresses) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+        let (mut ids, mut addresses, mut roles) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
         for n in &self.nodes {
             anyhow::ensure!(valid_id(&n.id) && ids.insert(&n.id) && addresses.insert(&n.address), "invalid/duplicate node identity");
             anyhow::ensure!(!n.key_file.as_os_str().is_empty(), "missing trusted key-file reference");
+            // A role may be declared at most once; absent roles leave the node
+            // eligible for any capable stage (backward compatible).
+            anyhow::ensure!(n.role.is_none_or(|role| roles.insert(role)), "duplicate node role");
             anyhow::ensure!(!n.templates.is_empty() && n.templates.iter().all(|t| match self.mode {
                 Mode::Local => matches!(t.as_str(), "sum-native-v1" | "control-native-v1"),
                 Mode::Real => matches!(t.as_str(), "sum-v1" | "control-v1" | "project-work-v1"),
@@ -80,6 +99,12 @@ impl Config {
             shape.validate()?;
         }
         Ok(())
+    }
+    /// The node id bound to a fixed role, when the config declares one. Callers
+    /// use this to pin a pipeline stage to its role's worker; `None` means the
+    /// config predates roles and the stage keeps load-based assignment.
+    pub fn node_for_role(&self, role: NodeRole) -> Option<&str> {
+        self.nodes.iter().find(|n| n.role == Some(role)).map(|n| n.id.as_str())
     }
     pub fn load_nodes(&self, base: &std::path::Path) -> Result<Vec<NodeSpec>> {
         use std::io::Read;

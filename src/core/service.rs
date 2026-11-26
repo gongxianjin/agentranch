@@ -85,7 +85,7 @@ pub enum UiCommand {
  ProjectCreate{name:String},ProjectImport{project_id:String,path:PathBuf},ProjectConfirm{project_id:String,version:u32,sha256:String},ProjectSplit{project_id:String},TaskReview{project_id:String,task_id:String,approve:bool,reason:String},TaskRedo{project_id:String,task_id:String},ProjectStart{project_id:String},ProjectTest{project_id:String},ProjectRepair{project_id:String,reason:String},ProjectAccept{project_id:String},ProjectRefresh{project_id:String},ProjectConfigure{config_path:PathBuf},
 }
 #[derive(Clone, Debug, PartialEq, Eq)] pub enum SubmitError{Busy,Stopped}
-#[derive(Clone, Debug, serde::Serialize)] pub struct ServiceError{pub code:String,pub message:String,pub next_step:String}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)] pub struct ServiceError{pub code:String,pub message:String,pub next_step:String}
 #[derive(Clone, Debug)] pub struct CommandResult{pub request_id:u64,pub result:Result<serde_json::Value,ServiceError>}
 /// Process-local display metadata; never serialized or admitted to Store.
 #[derive(Clone, Debug)]
@@ -119,15 +119,15 @@ impl LiveMailbox {
   } else {self.events.push(event);}
  }
 }
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)] #[serde(rename_all = "snake_case")] pub enum Readiness{NotStarted,Starting,Ready,NotReady,Stopped}
-#[derive(Clone, Debug, serde::Serialize)] pub struct DependencyView{pub id:String,pub state:String,pub detail:String,pub source:String,pub observed_at:u64}
-#[derive(Clone, Debug, serde::Serialize)] pub struct RunView{pub run:Run,pub read_only:bool,pub can_status:bool,pub can_approvals:bool,pub can_decide:bool,pub can_report:bool,pub can_retry:bool,pub can_cancel:bool,pub disabled_reason:Option<String>}
-#[derive(Clone, Debug, serde::Serialize)] pub struct NodeView{pub id:String,pub address:String,pub used:u32,pub slots:u32,pub admitted:bool,pub healthy:bool,pub draining:bool,pub source:String,pub observed_at:u64}
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)] pub enum DecisionKind{AllowOnce,RejectOnce}
-#[derive(Clone, Debug, serde::Serialize)] pub struct OfferedDecision{pub id:String,pub kind:DecisionKind,pub label:String}
-#[derive(Clone, Debug, serde::Serialize)] pub struct ApprovalView{pub run_id:String,pub attempt:u32,pub session:String,pub request_id:String,pub generation:u64,pub scope_hash:String,pub expires_at:u64,pub offered:Vec<OfferedDecision>,pub summary:String,pub simulated:bool,pub can_decide:bool}
-#[derive(Clone, Debug, serde::Serialize)] pub struct GatewayView { pub worker_id:String,pub host:String,pub remote_verified:bool,pub preflight_passed:bool,pub credentials_available:bool,pub used_slots:u32,pub artifact_sha256:String }
-#[derive(Clone, Debug, serde::Serialize)] pub struct AppSnapshot{pub mode:Mode,pub role:String,pub readiness:Readiness,pub actor:Option<Actor>,pub observed_at:u64,pub running:bool,pub dependencies:Vec<DependencyView>,pub runs:Vec<RunView>,pub nodes:Vec<NodeView>,pub approvals:Vec<ApprovalView>,pub errors:Vec<ServiceError>,pub unfinished:usize,pub projects:Vec<ProjectSnapshot>,pub gateway:Option<GatewayView>,pub provision_ledger:Option<ProvisionLedger>}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)] #[serde(rename_all = "snake_case")] pub enum Readiness{NotStarted,Starting,Ready,NotReady,Stopped}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] pub struct DependencyView{pub id:String,pub state:String,pub detail:String,pub source:String,pub observed_at:u64}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] pub struct RunView{pub run:Run,pub read_only:bool,pub can_status:bool,pub can_approvals:bool,pub can_decide:bool,pub can_report:bool,pub can_retry:bool,pub can_cancel:bool,pub disabled_reason:Option<String>}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] pub struct NodeView{pub id:String,pub address:String,pub used:u32,pub slots:u32,pub admitted:bool,pub healthy:bool,pub draining:bool,pub source:String,pub observed_at:u64}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)] pub enum DecisionKind{AllowOnce,RejectOnce}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] pub struct OfferedDecision{pub id:String,pub kind:DecisionKind,pub label:String}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] pub struct ApprovalView{pub run_id:String,pub attempt:u32,pub session:String,pub request_id:String,pub generation:u64,pub scope_hash:String,pub expires_at:u64,pub offered:Vec<OfferedDecision>,pub summary:String,pub simulated:bool,pub can_decide:bool}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] pub struct GatewayView { pub worker_id:String,pub host:String,pub remote_verified:bool,pub preflight_passed:bool,pub credentials_available:bool,pub used_slots:u32,pub artifact_sha256:String }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] pub struct AppSnapshot{pub mode:Mode,pub role:String,pub readiness:Readiness,pub actor:Option<Actor>,pub observed_at:u64,pub running:bool,pub dependencies:Vec<DependencyView>,pub runs:Vec<RunView>,pub nodes:Vec<NodeView>,pub approvals:Vec<ApprovalView>,pub errors:Vec<ServiceError>,pub unfinished:usize,pub projects:Vec<ProjectSnapshot>,pub gateway:Option<GatewayView>,pub provision_ledger:Option<ProvisionLedger>}
 use std::{sync::{Condvar,Mutex,atomic::{AtomicBool,AtomicUsize,Ordering},mpsc::{self,SyncSender,Receiver,TrySendError}},time::{Duration,SystemTime,UNIX_EPOCH},io::{Read,Write},path::Path};
 use anyhow::{Result,Context,ensure};
 use serde_json::{Value,json};
